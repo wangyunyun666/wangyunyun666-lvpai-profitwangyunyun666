@@ -5,5 +5,10 @@ matplotlib
 sqlalchemy
 werkzeug
 openpyxl
-# 上云（Streamlit Cloud / Railway / Render 等）需外部 Postgres 时用的驱动
+# ===== 上云（Streamlit Cloud / Railway / Render 等）需外部 Postgres 时的驱动 =====
+# 说明：SQLAlchemy 2.x 对 "postgresql://" 会先后探测 psycopg(3) 与 psycopg2。
+# 曾出现线上只装 psycopg2 但被探测 psycopg 失败、报
+# "ModuleNotFoundError: No module named 'psycopg'" 的情况（database.py 已改为
+# 主动挑选驱动并显式指定，双驱动兼容）。此处两个都声明，避免环境差异导致连不上库。
 psycopg2-binary
+psycopg[binary]

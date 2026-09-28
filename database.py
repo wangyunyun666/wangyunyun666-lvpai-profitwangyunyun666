@@ -1,4 +1,4 @@
-# database.py
+﻿# database.py
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Boolean, ForeignKey, func, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -18,10 +18,42 @@ if DATABASE_URL.startswith("sqlite"):
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.close()
 else:
+    # ===== PostgreSQL（Neon 等云库）连接 =====
+    # 兼容性说明（修复 ModuleNotFoundError: No module named 'psycopg'）：
+    # SQLAlchemy 2.x 对 "postgresql://" 会**先后探测 psycopg(3) 与 psycopg2**，
+    # 若运行环境只装了其中之一、或探测顺序与安装情况不符，就会抛
+    # ModuleNotFoundError。此处改为**主动挑选已安装的驱动**并显式指定，
+    # 不再依赖 SQLAlchemy 的自动回退，保证在 psycopg / psycopg2 任一存在时都能连上。
+    def _pick_pg_driver(url: str) -> str:
+        """把裸 postgresql:// 补全为显式驱动的 URL。
+
+        优先 psycopg（v3），回退 psycopg2；两者都缺时保留原样，
+        由 SQLAlchemy 抛出原始错误，便于定位。
+        """
+        if "://" not in url:
+            return url
+        scheme, rest = url.split("://", 1)
+        # 已显式指定驱动（如 postgresql+psycopg2://）则原样返回
+        if "+" in scheme:
+            return url
+        if scheme not in ("postgres", "postgresql"):
+            return url
+        try:
+            import psycopg  # noqa: F401  psycopg 3
+            return "postgresql+psycopg://" + rest
+        except ImportError:
+            pass
+        try:
+            import psycopg2  # noqa: F401  psycopg 2
+            return "postgresql+psycopg2://" + rest
+        except ImportError:
+            return url
+
+    _pg_url = _pick_pg_driver(DATABASE_URL)
     # Neon 为无服务器库，空闲连接会被断开；开启 pool_pre_ping 探活，
     # 连接失效时自动重连，避免 Streamlit Cloud 复用死连接抛 OperationalError
     engine = create_engine(
-        DATABASE_URL,
+        _pg_url,
         pool_pre_ping=True,
         pool_recycle=280,
         connect_args={"connect_timeout": 10},
