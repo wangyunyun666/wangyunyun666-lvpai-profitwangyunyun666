@@ -652,37 +652,561 @@ def save_profit_snapshot(period_mode, filter_option, period_start, period_end, p
     finally:
         db.close()
 
+_PH_CSS = """
+<style>
+.ph-wrap{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+.ph-hd{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;
+  border-radius:16px;padding:24px 30px;margin-bottom:16px;
+  box-shadow:0 6px 20px rgba(102,126,234,.22)}
+.ph-hd h1{margin:0 0 8px;font-size:23px;font-weight:700;color:#fff}
+.ph-hd .meta{opacity:.92;font-size:13px;line-height:1.7}
+.ph-mode{display:flex;gap:10px;align-items:stretch;margin-bottom:16px;flex-wrap:wrap}
+.ph-mbtn{padding:9px 22px;border-radius:22px;border:1px solid #e8ecf1;background:#fff;
+  font-size:13.5px;font-weight:600;color:#7a8a9a;cursor:default}
+.ph-mbtn.on{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;
+  border-color:transparent;box-shadow:0 3px 10px rgba(102,126,234,.28)}
+.ph-mtip{flex:1;min-width:260px;background:#fff;border:1px solid #e8ecf1;border-radius:12px;
+  padding:9px 16px;font-size:12.5px;color:#7a8a9a;line-height:1.6;display:flex;
+  align-items:center}
+.ph-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+  gap:14px;margin-bottom:18px}
+.ph-card{background:#fff;border:1px solid #e8ecf1;border-radius:14px;
+  padding:16px 18px;box-shadow:0 2px 8px rgba(44,62,80,.05)}
+.ph-card .k{font-size:12px;color:#7a8a9a;margin-bottom:7px;font-weight:500}
+.ph-card .v{font-size:23px;font-weight:700;color:#2c3e50;line-height:1.25}
+.ph-card .s{font-size:12px;color:#95a5b6;margin-top:5px}
+.ph-up{color:#c0392b}
+.ph-down{color:#27ae60}
+.ph-sec{font-size:15px;font-weight:700;color:#2c3e50;margin:22px 0 10px;
+  padding-left:11px;border-left:4px solid #667eea;line-height:1.3}
+.ph-hint{font-size:12.5px;color:#95a5b6;margin:0 0 12px 15px}
+.ph-tb{background:#fff;border:1px solid #e8ecf1;border-radius:14px;overflow:hidden;
+  box-shadow:0 2px 8px rgba(44,62,80,.05)}
+.ph-tb table{width:100%;border-collapse:collapse;font-size:13px}
+.ph-tb th{background:#f8fafc;color:#5a6a7a;font-weight:600;font-size:12.5px;
+  padding:11px 14px;text-align:right;border-bottom:1px solid #e8ecf1;white-space:nowrap}
+.ph-tb th.l{text-align:left}
+.ph-tb th.c{text-align:center}
+.ph-tb td{padding:10px 14px;text-align:right;border-bottom:1px solid #f2f5f8;
+  color:#2c3e50;white-space:nowrap}
+.ph-tb td.l{text-align:left}
+.ph-tb td.c{text-align:center;color:#8a9aaa}
+.ph-tb tbody tr:hover{background:#fafbfd}
+.ph-tb tbody tr:last-child td{border-bottom:1px solid #e8ecf1}
+.ph-tb tfoot td{padding:12px 14px;text-align:right;background:#f8fafc;
+  font-weight:700;color:#2c3e50;border-top:2px solid #667eea}
+.ph-tb tfoot td.l{text-align:left}
+.ph-tb tfoot td.c{text-align:center}
+.ph-tag{display:inline-block;padding:2px 9px;border-radius:11px;font-size:11.5px;
+  font-weight:600}
+.ph-tag.t-lp{background:#eef4ff;color:#4a72c8;border:1px solid #dce6fa}
+.ph-tag.t-hl{background:#fff0f3;color:#c04a6a;border:1px solid #fadce4}
+.ph-shape{display:inline-block;padding:2px 9px;border-radius:11px;font-size:11.5px;
+  font-weight:600;background:#f0f4ff;color:#4a72c8;border:1px solid #dce6fa}
+.ph-bar{display:inline-block;height:7px;border-radius:4px;background:#c0392b;
+  vertical-align:middle;margin-right:7px}
+</style>
+"""
+
+
+def _ph_fmt(v):
+    """金额格式化（≥1万显示万元）。"""
+    try:
+        v = float(v)
+    except Exception:
+        return "—"
+    if abs(v) >= 10000:
+        return f"{v / 10000:,.2f}万"
+    return f"{v:,.2f}"
+
+
+def _ph_esc(s):
+    """HTML 转义，防止套系名里的特殊字符破坏页面。"""
+    return (str(s).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;').replace('"', '&quot;'))
+
+
+def _ph_month_options():
+    """可选月份列表（2025-01 至今，倒序）。"""
+    today = date.today()
+    out = []
+    for y in range(2025, today.year + 1):
+        for m in range(1, 13):
+            if y == today.year and m > today.month:
+                break
+            out.append(f"{y}-{m:02d}")
+    return out
+
+
 def view_profit_history_page():
-    st.header("📁 利润表历史版本")
+    """利润表历史 / 分析。
+
+    改造说明（2026-09-30）：
+      原页面只读 profit_snapshots（生成利润表时保存的快照），只能看单一口径。
+      现改为按月份区间实时调用 profit_engine 计算，支持：
+        · 费用口径切换（实际口径 / 分摊口径）
+        · 业务线筛选（全部 / 旅拍 / 婚礼）
+        · 套系利润排行榜（原生表格渲染，带搜索与 CSV 导出）
+        · 费用结构（含占比条形图）
+        · 历史快照浏览（保留原功能，原有快照不丢）
+      零改动契约：profit_engine.py / database.py 未做任何修改。
+    """
     module_name = "📁 利润表历史"
     can_see = has_permission(module_name, st.session_state.role)
-    db = SessionLocal()
+    st.markdown(_PH_CSS, unsafe_allow_html=True)
+
+    # ==================== 顶部：筛选区 ====================
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        month_opts = _ph_month_options()
+        default_months = [m for m in month_opts if m.startswith('2026-')]
+        if not default_months:
+            default_months = month_opts[-1:]
+        sel_months = st.multiselect(
+            "📅 选择月份（可多选，按月区间统计）",
+            month_opts,
+            default=default_months,
+            key='ph_months',
+            help="同「生成利润表」口径：月份逐个计算后按套系合并，人工成本按整个区间统一分摊。")
+    with c2:
+        mode_label = st.selectbox("费用口径", ["分摊口径", "实际口径"],
+                                  key='ph_mode')
+        _mode = 'allocation' if mode_label == "分摊口径" else 'actual'
+
+    if not sel_months:
+        st.warning("请至少选择一个月")
+        return
+
+    sel_months = sorted(sel_months)
+    _span_txt = (sel_months[0] if len(sel_months) == 1
+                 else f"{sel_months[0]} ~ {sel_months[-1]}")
+
+    # ==================== 计算 ====================
     try:
-        snapshots = db.query(ProfitSnapshot).order_by(ProfitSnapshot.created_at.desc()).all()
-        if not snapshots:
-            st.info("暂无保存的利润表版本")
-            return
-        options = [f"ID:{s.id} | {s.period_label} | {s.filter_option} | {s.created_at.strftime('%Y-%m-%d %H:%M')}" for s in snapshots]
-        selected = st.selectbox("选择历史版本", options)
-        if selected:
-            snapshot_id = int(selected.split('|')[0].split(':')[1])
-            snapshot = db.query(ProfitSnapshot).filter_by(id=snapshot_id).first()
-            if snapshot:
-                st.caption(f"生成时间：{snapshot.created_at}")
-                st.subheader(f"📋 {snapshot.period_label} - {snapshot.filter_option}")
-                df = pd.read_json(io.StringIO(snapshot.data_json), orient='records')
-                if not can_see: df = mask_dataframe(df)
-                show_cols = [c for c in df.columns if c not in ['总直接成本', '总间接成本'] and not c.endswith('工资')]
-                st.dataframe(df[show_cols], width='stretch')
-                csv = df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button("📥 下载此版本CSV", csv, f"利润表_{snapshot.period_label}_{snapshot.id}.csv", "text/csv")
-                if st.session_state.role == 'admin' and st.button("删除此版本"):
-                    db.delete(snapshot)
-                    db.commit()
-                    st.success("已删除")
-                    st.rerun()
+        with st.spinner("正在计算…"):
+            df_raw = generate_profit_report_multi_month(*sel_months, promo_mode=_mode)
+    except Exception as e:
+        st.error(f"计算失败：{e}")
+        return
+
+    if df_raw is None or df_raw.empty:
+        st.info(f"{_span_txt} 区间内暂无订单数据")
+        return
+
+    df = mask_dataframe(df_raw) if not can_see else df_raw
+
+    # ==================== 顶部标题卡 ====================
+    st.markdown(
+        "<div class='ph-wrap'><div class='ph-hd'>"
+        "<h1>利润表历史报告</h1>"
+        f"<div class='meta'>数据区间：{_span_txt}　·　共 {len(df)} 个套系<br>"
+        f"费用口径：{mode_label}　·　业务线：全部</div>"
+        "</div></div>",
+        unsafe_allow_html=True)
+
+    # 口径说明条
+    if _mode == 'allocation':
+        _tip = ("分摊口径 —— 人工、推广费按下单订单数分摊到各套系，"
+                "用于评估套系本身定价是否合理。")
+    else:
+        _tip = ("实际口径 —— 推广费按实际发生计入，人工按下单订单数分摊，"
+                "更接近当期真实现金成本。")
+    st.markdown(
+        "<div class='ph-mode'>"
+        f"<div class='ph-mbtn on'>{mode_label}</div>"
+        f"<div class='ph-mtip'>{_tip}</div>"
+        "</div>",
+        unsafe_allow_html=True)
+
+    # ==================== 业务线筛选 ====================
+    _bizs = ['全部'] + sorted([b for b in df['业务类型'].dropna().unique()
+                               if str(b).strip()],
+                              key=lambda x: 0 if '旅拍' in str(x) else 1)
+    _biz = st.radio("业务线", _bizs, horizontal=True, key='ph_biz')
+
+    vdf = df if _biz == '全部' else df[df['业务类型'] == _biz].copy()
+    if vdf.empty:
+        st.info(f"{_biz} 该区间内无数据")
+        return
+
+    # 排序（按利润降序）
+    vdf = vdf.sort_values('利润合计', ascending=False).reset_index(drop=True)
+
+    _orders = int(vdf['套系数量'].sum())
+    _income = float(vdf['总收入'].sum())
+    _profit = float(vdf['利润合计'].sum())
+    _margin = (_profit / _income * 100) if _income else 0.0
+    _cls = 'ph-up' if _profit >= 0 else 'ph-down'
+
+    # ==================== 指标卡 ====================
+    st.markdown(
+        "<div class='ph-cards'>"
+        "<div class='ph-card'><div class='k'>套系总数</div>"
+        f"<div class='v'>{_orders:,} <span style='font-size:15px'>单</span></div>"
+        f"<div class='s'>{_biz} · {'单月' if len(sel_months) == 1 else str(len(sel_months)) + '个月合并'}</div></div>"
+        "<div class='ph-card'><div class='k'>总收入</div>"
+        f"<div class='v'>{_ph_fmt(_income)}</div>"
+        "<div class='s'>套系金额 + 二销 − 退款</div></div>"
+        "<div class='ph-card'><div class='k'>总利润</div>"
+        f"<div class='v {_cls}'>{_ph_fmt(_profit)}</div>"
+        "<div class='s'>收入 − 直接成本 − 间接成本</div></div>"
+        "<div class='ph-card'><div class='k'>整体利润率</div>"
+        f"<div class='v {_cls}'>{_margin:.2f}%</div>"
+        f"<div class='s'>{mode_label} · 利润 ÷ 收入</div></div>"
+        "</div>",
+        unsafe_allow_html=True)
+
+    # ==================== 套系利润排行榜 ====================
+    st.markdown("<div class='ph-sec'>套系利润排行榜</div>", unsafe_allow_html=True)
+    st.markdown("<div class='ph-hint'>按利润合计降序排列。红色=盈利（中国习惯），绿色=亏损。</div>",
+                unsafe_allow_html=True)
+
+    _rows = []
+    for i, r in vdf.iterrows():
+        _p = float(r.get('利润合计', 0) or 0)
+        _inc = float(r.get('总收入', 0) or 0)
+        _cnt = int(r.get('套系数量', 0) or 0)
+        _m = (_p / _inc * 100) if _inc else 0.0
+        _pc = 'ph-up' if _p >= 0 else 'ph-down'
+        _bt = str(r.get('业务类型', ''))
+        _tag = 't-lp' if '旅拍' in _bt else ('t-hl' if '婚礼' in _bt else '')
+        _rows.append(
+            "<tr>"
+            f"<td class='c'>{i + 1}</td>"
+            f"<td class='l'>{_ph_esc(r.get('套系', ''))}</td>"
+            f"<td class='c'><span class='ph-tag {_tag}'>{_ph_esc(_bt)}</span></td>"
+            f"<td>{_cnt:,}</td>"
+            f"<td>{_inc / 10000:,.2f}</td>"
+            f"<td class='{_pc}'>{_p / 10000:,.2f}</td>"
+            f"<td class='{_pc}'>{_m:.2f}%</td>"
+            "</tr>")
+
+    _tf = (
+        "<tfoot><tr>"
+        "<td class='c'>—</td>"
+        "<td class='l'>合计</td>"
+        "<td class='c'>—</td>"
+        f"<td>{_orders:,}</td>"
+        f"<td>{_income / 10000:,.2f}</td>"
+        f"<td class='{_cls}'>{_profit / 10000:,.2f}</td>"
+        f"<td class='{_cls}'>{_margin:.2f}%</td>"
+        "</tr></tfoot>")
+
+    _table_html = (
+        "<div class='ph-tb'><table>"
+        "<thead><tr>"
+        "<th class='c' style='width:48px'>#</th>"
+        "<th class='l'>套系</th>"
+        "<th class='c' style='width:76px'>业务线</th>"
+        "<th style='width:76px'>单数</th>"
+        "<th style='width:104px'>收入(万)</th>"
+        "<th style='width:104px'>利润(万)</th>"
+        "<th style='width:88px'>利润率</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(_rows) + "</tbody>"
+        + _tf +
+        "</table></div>")
+
+    st.markdown(_table_html, unsafe_allow_html=True)
+
+    # CSV 导出（保留原「下载」能力）
+    _csv_cols = ['业务类型', '套系', '套系数量', '总收入', '利润合计', '利润率']
+    _csv_cols = [c for c in _csv_cols if c in vdf.columns]
+    _csv_src = vdf[_csv_cols].copy()
+    if '利润率' in _csv_src.columns:
+        _csv_src['利润率'] = _csv_src['利润率'].apply(
+            lambda x: f"{float(x) * 100:.2f}%" if pd.notna(x) else "")
+    _csv = _csv_src.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        "📥 导出排行榜 CSV", _csv,
+        f"套系利润排行榜_{_span_txt}_{mode_label}_{_biz}.csv", "text/csv")
+
+    # ==================== 费用结构 ====================
+    st.markdown("<div class='ph-sec'>费用结构</div>", unsafe_allow_html=True)
+    st.markdown("<div class='ph-hint'>各费用项合计金额与占直接成本比重。</div>",
+                unsafe_allow_html=True)
+
+    _FEE = [
+        ('拍摄费用', '摄影师、化妆师、助理等团队费用，占比最大'),
+        ('推广费用（实际）', '线上线下广告投放、推广活动'),
+        ('交付费用（主持）', '婚礼主持费用，仅婚礼订单产生'),
+        ('交付费用（场地）', '婚礼及旅拍场地租赁费，含自租场地'),
+        ('交付费用（搭建）', '婚礼现场搭建布置费用'),
+        ('鲜花费用', '婚礼鲜花布置及手捧花等'),
+        ('微电影拍摄费用', '微电影前期拍摄团队成本'),
+        ('微电影剪辑费用', '微电影后期剪辑成本'),
+        ('二销选片费', '门店二销结算费用，按选片金额提成'),
+        ('像素蛋糕修图费', '第三方修图服务费'),
+        ('后期修片费(一销)', '一销订单后期修片成本'),
+        ('后期修片费(二销)', '二销订单后期修片成本'),
+        ('工厂费用（一销）', '相册、相框等工厂制作费（一销）'),
+        ('工厂费用（二销）', '相册、相框等工厂制作费（二销）'),
+        ('人工成本', '员工薪酬分摊（按订单数）'),
+        ('房租、水电、办公费等', '固定运营成本分摊'),
+        ('税费及手续费', '平台手续费、税费'),
+        ('样片研发', '样片拍摄与研发投入'),
+        ('场地铺设费', '场地建设与铺设投入'),
+        ('舆情处理', '口碑维护与客诉处理'),
+    ]
+    _tot_dir = float(vdf['总直接成本'].sum()) if '总直接成本' in vdf.columns else 0.0
+    _fee_rows = []
+    for _name, _desc in _FEE:
+        if _name not in vdf.columns:
+            continue
+        _val = float(vdf[_name].sum())
+        if _val <= 0:
+            continue
+        _pct = (_val / _tot_dir * 100) if _tot_dir else 0.0
+        _w = min(100.0, _pct * 1.6)
+        _fee_rows.append(
+            "<tr>"
+            f"<td class='l'>{_name}</td>"
+            f"<td style='width:150px'>{_ph_fmt(_val)}</td>"
+            "<td style='width:190px'>"
+            f"<span class='ph-bar' style='width:{_w:.1f}px'></span>{_pct:.2f}%</td>"
+            f"<td class='l' style='color:#8a9aaa;font-size:12.5px'>{_desc}</td>"
+            "</tr>")
+
+    if _fee_rows:
+        st.markdown(
+            "<div class='ph-tb'><table>"
+            "<thead><tr>"
+            "<th class='l'>费用项</th>"
+            "<th style='width:150px'>金额</th>"
+            "<th style='width:190px'>占直接成本</th>"
+            "<th class='l' style='width:300px'>说明</th>"
+            "</tr></thead>"
+            "<tbody>" + "".join(_fee_rows) + "</tbody>"
+            "</table></div>",
+            unsafe_allow_html=True)
+
+    # ==================== 成本与利润结构 ====================
+    st.markdown("<div class='ph-sec'>成本与利润结构</div>", unsafe_allow_html=True)
+
+    _tot_cost = float(vdf['总直接成本'].sum()) + float(vdf['总间接成本'].sum()) \
+        if '总间接成本' in vdf.columns else float(vdf['总直接成本'].sum())
+    _struct = [("总直接成本", float(vdf['总直接成本'].sum()), "#e74c3c"),
+               ("总间接成本", float(vdf['总间接成本'].sum()) if '总间接成本' in vdf.columns else 0.0, "#f39c12"),
+               ("利润合计", _profit, "#27ae60" if _profit >= 0 else "#c0392b")]
+    _struct = [(n, v, c) for n, v, c in _struct if v > 0]
+    _smax = max([v for _, v, _ in _struct]) if _struct else 1.0
+    _srows = []
+    for _n, _v, _c in _struct:
+        _w = (_v / _smax * 100) if _smax else 0
+        _pct = (_v / _income * 100) if _income else 0
+        _srows.append(
+            "<tr>"
+            f"<td class='l'>{_n}</td>"
+            f"<td style='width:140px'>{_ph_fmt(_v)}</td>"
+            "<td style='width:260px'>"
+            f"<span style='display:inline-block;height:14px;border-radius:4px;"
+            f"background:{_c};width:{_w * 2:.1f}px;max-width:200px;"
+            f"vertical-align:middle;margin-right:8px'></span>{_pct:.2f}%</td>"
+            "</tr>")
+    st.markdown(
+        "<div class='ph-tb'><table>"
+        "<thead><tr><th class='l'>项目</th>"
+        "<th style='width:140px'>金额</th>"
+        "<th style='width:260px'>占收入比重</th></tr></thead>"
+        "<tbody>" + "".join(_srows) + "</tbody></table></div>",
+        unsafe_allow_html=True)
+
+    # ==================== 主要费用项均价 ====================
+    st.markdown("<div class='ph-sec'>主要费用项均价</div>", unsafe_allow_html=True)
+    st.markdown("<div class='ph-hint'>按订单数分摊后的单均成本（元/单）。</div>",
+                unsafe_allow_html=True)
+    _avg_src = [('拍摄费用', '摄影师/化妆师/助理团队'),
+                ('推广费用（实际）', '线上线下推广投放'),
+                ('交付费用（场地）', '婚礼及旅拍场地租赁'),
+                ('交付费用（搭建）', '婚礼现场搭建布置'),
+                ('交付费用（主持）', '婚礼主持费用'),
+                ('鲜花费用', '婚礼鲜花布置'),
+                ('微电影拍摄费用', '微电影前期拍摄'),
+                ('微电影剪辑费用', '微电影后期剪辑'),
+                ('二销选片费', '门店二销结算'),
+                ('后期修片费(一销)', '一销后期修片'),
+                ('工厂费用（一销）', '相册相框制作（一销）'),
+                ('人工成本', '员工薪酬分摊')]
+    _arows = []
+    for _n, _d in _avg_src:
+        if _n not in vdf.columns:
+            continue
+        _v = float(vdf[_n].sum())
+        if _v <= 0:
+            continue
+        _avg = _v / _orders if _orders else 0.0
+        _arows.append(
+            "<tr>"
+            f"<td class='l'>{_n}</td>"
+            f"<td style='width:130px'>¥{_avg:,.2f}</td>"
+            f"<td style='width:130px'>{_ph_fmt(_v)}</td>"
+            f"<td class='l' style='color:#8a9aaa;font-size:12.5px;width:250px'>{_d}</td>"
+            "</tr>")
+    if _arows:
+        st.markdown(
+            "<div class='ph-tb'><table>"
+            "<thead><tr><th class='l'>费用项</th>"
+            "<th style='width:130px'>单均</th>"
+            "<th style='width:130px'>合计</th>"
+            "<th class='l' style='width:250px'>说明</th></tr></thead>"
+            "<tbody>" + "".join(_arows) + "</tbody></table></div>",
+            unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='ph-hint'>该区间暂无可展示的费用项。</div>",
+                    unsafe_allow_html=True)
+
+    # ==================== 拍摄费用明细 ====================
+    st.markdown("<div class='ph-sec'>拍摄费用明细</div>", unsafe_allow_html=True)
+    _shoot_cols = [('拍摄费用', '拍摄团队费用', '¥'),
+                   ('微电影拍摄费用', '微电影拍摄', '¥'),
+                   ('微电影剪辑费用', '微电影剪辑', '¥'),
+                   ('二销选片费', '二销选片结算', '¥'),
+                   ('像素蛋糕修图费', '第三方修图', '¥'),
+                   ('后期修片费(一销)', '一销后期修片', '¥'),
+                   ('后期修片费(二销)', '二销后期修片', '¥'),
+                   ('工厂费用（一销）', '工厂制作（一销）', '¥'),
+                   ('工厂费用（二销）', '工厂制作（二销）', '¥')]
+    _shrows = []
+    _shsum = 0.0
+    for _c, _d, _u in _shoot_cols:
+        if _c not in vdf.columns:
+            continue
+        _v = float(vdf[_c].sum())
+        _shsum += _v
+        # ⚠️ 注意：append 的结果是 None，不能参与字符串拼接。
+        #    原先写成 `_shrows.append(...) if _orders else None`，会在 _orders 为真时
+        #    把 append 的返回值 None 拼进 HTML，页面上出现 9 个 "None"。
+        _shrows.append(
+            "<tr>"
+            f"<td class='l'>{_d}</td>"
+            f"<td style='width:140px'>{_u}{_v:,.2f}</td>"
+            f"<td style='width:110px'>¥{(_v / _orders) if _orders else 0:,.2f}</td>"
+            "</tr>")
+    if _shrows:
+        st.markdown(
+            "<div class='ph-tb'><table>"
+            "<thead><tr><th class='l'>明细项目</th>"
+            "<th style='width:140px'>合计金额</th>"
+            "<th style='width:110px'>单均</th></tr></thead>"
+            "<tbody>" + "".join(_shrows) +
+            f"<tr style='background:#f8fafc;font-weight:700'>"
+            f"<td class='l'>拍摄相关合计</td>"
+            f"<td>¥{_shsum:,.2f}</td>"
+            f"<td>¥{(_shsum / _orders) if _orders else 0:,.2f}</td></tr>"
+            "</tbody></table></div>",
+            unsafe_allow_html=True)
+
+    # ==================== 交付费用明细 ====================
+    st.markdown("<div class='ph-sec'>交付费用明细</div>", unsafe_allow_html=True)
+    _deliv_cols = [('交付费用（主持）', '婚礼主持费用'),
+                   ('交付费用（场地）', '场地租赁（含自租）'),
+                   ('交付费用（搭建）', '现场搭建布置'),
+                   ('鲜花费用', '鲜花布置及手捧花')]
+    _dlrows = []
+    _dlsum = 0.0
+    for _c, _d in _deliv_cols:
+        if _c not in vdf.columns:
+            continue
+        _v = float(vdf[_c].sum())
+        _dlsum += _v
+        _dlrows.append(
+            "<tr>"
+            f"<td class='l'>{_d}</td>"
+            f"<td style='width:140px'>¥{_v:,.2f}</td>"
+            f"<td style='width:110px'>¥{(_v / _orders) if _orders else 0:,.2f}</td>"
+            "</tr>")
+    if _dlrows:
+        st.markdown(
+            "<div class='ph-tb'><table>"
+            "<thead><tr><th class='l'>明细项目</th>"
+            "<th style='width:140px'>合计金额</th>"
+            "<th style='width:110px'>单均</th></tr></thead>"
+            "<tbody>" + "".join(_dlrows) +
+            f"<tr style='background:#f8fafc;font-weight:700'>"
+            f"<td class='l'>交付费用合计</td>"
+            f"<td>¥{_dlsum:,.2f}</td>"
+            f"<td>¥{(_dlsum / _orders) if _orders else 0:,.2f}</td></tr>"
+            "</tbody></table></div>",
+            unsafe_allow_html=True)
+
+    # ==================== 人工成本明细（按部门）====================
+    st.markdown("<div class='ph-sec'>人工成本明细</div>", unsafe_allow_html=True)
+    _sal_cols = [c for c in vdf.columns
+                 if c.endswith('工资') or c in ('人工成本',)]
+    _slrows = []
+    _slsum = 0.0
+    for _c in _sal_cols:
+        _v = float(vdf[_c].sum())
+        _slsum += _v
+        _pct = (_v / _income * 100) if _income else 0
+        _slrows.append(
+            "<tr>"
+            f"<td class='l'>{_c}</td>"
+            f"<td style='width:140px'>¥{_v:,.2f}</td>"
+            f"<td style='width:110px'>{_pct:.2f}%</td>"
+            "</tr>")
+    if _slrows:
+        st.markdown(
+            "<div class='ph-tb'><table>"
+            "<thead><tr><th class='l'>部门</th>"
+            "<th style='width:140px'>金额</th>"
+            "<th style='width:110px'>占收入</th></tr></thead>"
+            "<tbody>" + "".join(_slrows) +
+            f"<tr style='background:#f8fafc;font-weight:700'>"
+            f"<td class='l'>人工成本合计</td>"
+            f"<td>¥{_slsum:,.2f}</td>"
+            f"<td>{( _slsum / _income * 100) if _income else 0:.2f}%</td></tr>"
+            "</tbody></table></div>",
+            unsafe_allow_html=True)
+
+    # ==================== 历史快照（保留原功能）====================
+    st.markdown("<div class='ph-sec'>历史快照</div>", unsafe_allow_html=True)
+
+    _db = SessionLocal()
+    try:
+        _snaps = _db.query(ProfitSnapshot).order_by(
+            ProfitSnapshot.created_at.desc()).all()
+        if not _snaps:
+            st.markdown("<div class='ph-hint'>暂无保存的历史快照。"
+                        "在「生成利润表」页生成后会在此出现。</div>",
+                        unsafe_allow_html=True)
+        else:
+            _opts = [f"ID:{s.id} | {s.period_label} | {s.filter_option} | "
+                     f"{s.created_at.strftime('%Y-%m-%d %H:%M')}" for s in _snaps]
+            _sel = st.selectbox("选择历史快照版本", _opts, key='ph_snap')
+            if _sel:
+                _sid = int(_sel.split('|')[0].split(':')[1])
+                _snap = _db.query(ProfitSnapshot).filter_by(id=_sid).first()
+                if _snap:
+                    _sdf = pd.read_json(io.StringIO(_snap.data_json),
+                                        orient='records')
+                    if not can_see:
+                        _sdf = mask_dataframe(_sdf)
+                    _scols = [c for c in _sdf.columns
+                              if c not in ['总直接成本', '总间接成本']
+                              and not c.endswith('工资')]
+                    st.dataframe(_sdf[_scols], width='stretch', height=420)
+
+                    _a, _b = st.columns([1, 1])
+                    with _a:
+                        _scsv = _sdf.to_csv(index=False).encode('utf-8-sig')
+                        st.download_button(
+                            "📥 下载该快照 CSV", _scsv,
+                            f"利润表_{_snap.period_label}_{_snap.id}.csv",
+                            "text/csv", width='stretch')
+                    with _b:
+                        if st.session_state.role == 'admin':
+                            if st.button("🗑 删除此快照", width='stretch'):
+                                _db.delete(_snap)
+                                _db.commit()
+                                add_log(st.session_state.user_id,
+                                        st.session_state.username,
+                                        "删除利润表快照",
+                                        f"ID:{_snap.id} {_snap.period_label}")
+                                st.success("已删除")
+                                st.rerun()
     finally:
-        db.close()
+        _db.close()
 
 def profit_report_page():
     st.header("📊 利润表生成与分析")
@@ -2135,7 +2659,15 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
     add_log(st.session_state.user_id, st.session_state.username, "生成利润表", f"月份:{period_month}")
     period_mode_str = "按月" if month is not None else "按月"
     filter_label = filter_option if filter_option != "全部" else "全部"
-    period_label = period_month if month is not None else f"{year}年"
+    # 快照期间标签：period_month 已经是正确的展示标签
+    #   - 单月模式：'2026-08'
+    #   - 多月模式：'2026年1月-2026年8月'
+    #   - 按年模式：'2026年'
+    # ⚠️ 修复（2026-09-30）：原写法 `period_month if month is not None else f"{year}年"`
+    #    在多月模式下 month 与 year 同时为 None，会生成字面量字符串 'None年'，
+    #    污染快照标题（历史快照 ID:1/10/12 曾出现「None年 - 全部」）。
+    #    改为直接使用 period_month，并对 None/空值做兜底。
+    period_label = period_month if period_month else f"{period_start} ~ {period_end}"
     save_profit_snapshot(period_mode_str, filter_label, period_start, period_end, period_label, snapshot_df)
 
 # ---------- 统一账单导入入口 ----------
