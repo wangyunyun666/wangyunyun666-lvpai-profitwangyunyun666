@@ -1,4 +1,4 @@
-﻿# app.py
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,6 +6,9 @@ import json
 import io
 pd.set_option("styler.render.max_elements", 10**9)  # 设置为10亿，足够覆盖任何查询结果
 from datetime import datetime, date, timedelta
+from workbench import workbench_page, _wb_handle_goto
+from import_center import import_center_page, inject_ic_css as _ic_css
+import auth_persist as _auth
 from database import SessionLocal, User, Order, SetStandardCost, ActualDirectCost, CherryProductCost, IndirectCost, AllocationRule, OperationLog, MonthlyStats, ModulePermission, ProfitSnapshot, EmployeeSalary
 from profit_engine import generate_profit_report, generate_profit_report_multi_month
 from sqlalchemy import func
@@ -15,7 +18,7 @@ import calendar
 import time
 import os
 
-st.set_page_config(page_title="旅拍利润系统", page_icon="📸", layout="wide")
+st.set_page_config(page_title="旅拍利润系统", layout="wide")
 
 st.markdown("""
 <style>
@@ -60,6 +63,17 @@ if 'role' not in st.session_state: st.session_state.role = None
 # 会话超时（加固）：从环境变量读取，默认 480 分钟，转换为秒
 SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MIN", "480")) * 60
 
+# ============================================================================
+# 持久化登录（新增，2026-09）
+# ----------------------------------------------------------------------------
+# 解决"过一会不用就被踢回登录页"：session_state 只活在 WebSocket 连接期间，
+# 连接一断就丢；改为把签名令牌存进浏览器 cookie，重连时自动恢复登录态。
+# 令牌签名与有效期逻辑全部在 auth_persist.py，此处只做接入。
+# ============================================================================
+_auth.try_restore_login()          # 必须先于任何页面渲染
+_auth.check_session_timeout()      # 应用内超时（默认 480 分钟）及时长判断
+_auth.flush_pending_cookie()       # 登录/退出后的 cookie 落盘
+
 def add_log(user_id, username, action, details=""):
     db = SessionLocal()
     try:
@@ -90,6 +104,7 @@ def login_page():
             st.session_state.user_id = user.id
             st.session_state.username = user.username
             st.session_state.role = user.role
+            _auth.save_login(user.username, user.role, user.id)  # 写入持久化 cookie
             add_log(user.id, user.username, "登录", "登录成功")
             st.success("登录成功！"); st.rerun()
         else: st.error("用户名或密码错误")
@@ -126,40 +141,63 @@ def mask_dataframe(df):
         df_masked[col] = '***'
     return df_masked
 
+
+# ---- 导航菜单（正式可见项）----
+# 说明：原「导入类」入口已全部收进「📥 数据导入中心」，故此处不再单独列出，
+# 菜单从 24 项精简为 13 项。对应的页面函数与路由分支均**原样保留**，
+# 只是不再出现在侧边栏；如需恢复某个入口，把它加回本列表即可。
+_WB_MENU = [
+    "🏠 工作台",
+    "📥 数据导入中心",
+    "📊 生成利润表",
+    "📁 利润表历史",
+    "📋 运营成本查询",
+    "🔍 选片订单查询",
+    "📋 账单查询",
+    "📋 数据查询",
+    "🧹 清理重复数据",
+    "🔧 修复历史拍摄费用解析",
+    "📖 规则说明",
+    "🔐 权限管理",
+    "👥 用户管理",
+    "📜 操作日志",
+]
+
+# ---- 已收进导入中心的入口（保留变量以便将来恢复/排查，不在菜单中显示）----
+_WB_MENU_HIDDEN = [
+    "📥 导入收入数据",
+    "📊 导入运营成本",
+    "📋 维护标准成本",
+    "💰 导入实际直接成本",
+    "🏭 导入樱桃云产品成本",
+    "📈 录入间接成本",
+    "👥 员工工资管理",
+    "📊 录入月度基础数据",
+    "⚙️ 推广费分摊设置",
+    "📥 账单导入",
+    "🏜️ 新疆费用导入",
+]
+
+
 def main_sidebar():
     with st.sidebar:
         st.title(f"👤 {st.session_state.username}")
         st.caption(f"角色：{'🔑 管理员' if st.session_state.role == 'admin' else '✏️ 编辑者'}")
         st.divider()
-        menu = st.radio("导航菜单", [
-            "📊 生成利润表",
-            "📁 利润表历史",
-            "📥 导入收入数据",
-            "📊 导入运营成本",
-            "📋 运营成本查询",
-            "📋 维护标准成本",
-            "💰 导入实际直接成本",
-            "🏭 导入樱桃云产品成本",
-            "📈 录入间接成本",
-            "👥 员工工资管理",
-            "📊 录入月度基础数据",
-            "⚙️ 推广费分摊设置",
-            "🔍 选片订单查询",
-            "📥 账单导入",
-            "🏜️ 新疆费用导入",
-            "📋 账单查询",
-            "📋 数据查询",
-            "🧹 清理重复数据",
-            "🔧 修复历史拍摄费用解析",
-            "📖 规则说明",
-            "🔐 权限管理",
-            "👥 用户管理",
-            "📜 操作日志"
-        ])
+        # ---- 工作台跳转通道（必须在 radio 之前）----
+        _wb_handle_goto(_WB_MENU)
+        menu = st.radio("导航菜单", _WB_MENU, key="nav_menu")
         st.divider()
         if st.button("🚪 退出登录"):
             add_log(st.session_state.user_id, st.session_state.username, "退出", "退出登录")
-            st.session_state.logged_in = False; st.rerun()
+            # 清除持久化 cookie。⚠️ 必须先落盘再 rerun：clear_login 靠渲染
+            # 隐藏 iframe 执行 JS，若之后立刻 rerun，这次渲染会被丢弃，cookie 清不掉。
+            _auth.clear_login()
+            st.session_state.logged_in = False
+            st.session_state._login_ts = 0
+            # 给浏览器一点时间执行清理脚本；随后由下面的 rerun 回到登录页
+            time.sleep(0.6)
+            st.rerun()
         return menu
 
 def permission_management_page():
@@ -1309,6 +1347,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                 # ==================== 拍摄费用明细分析（含同比、环比） ====================
                 st.divider()
                 with st.expander(f"📸 {biz_type}拍摄费用明细分析（含同比）", expanded=False):
+                    st.caption("💡 看表须知：这里的「均价」是把这项费用平摊到当月所有订单上算出来的，没产生这笔费用的订单也算进去了。"
+                               "所以订单变多、发生这笔费用的订单变少，均价都会自然变小 —— 看到涨跌不能直接当成涨价或降价，"
+                               "建议对照页面顶部的订单总数一同判断。")
                     db2 = SessionLocal()
                     if biz_type == "全部业务":
                         biz_orders = db2.query(Order.order_id).filter(
@@ -2692,6 +2733,11 @@ def indirect_cost_page():
         **文件格式**：必须包含列 `期间`、`业务类型`（旅拍/婚礼）、`费用项`、`金额`  
         费用项可使用：`房租、水电、办公费等`、`税费及手续费`、`样片研发`、`场地铺设费`、`舆情处理` 等。
         """)
+        st.warning(
+            "**「样片研发」只填新疆以外的拍样费用。** "
+            "新疆拍样费用请**单独**到「🏜️ 新疆拍样/报销费用」导入"
+            "（要走 `business_type='新疆'`，系统才能按新疆订单数分摊到旅拍与婚礼）。"
+            "两者填错会出现重复计算或漏算。", icon="⚠️")
         st.download_button("📥 下载间接费用导入模板", 
                            pd.DataFrame(columns=['期间', '业务类型', '费用项', '金额']).to_csv(index=False).encode('utf-8-sig'),
                            "间接费用模板.csv", "text/csv")
@@ -2731,6 +2777,8 @@ def indirect_cost_page():
                 st.error(f"缺少必要列：{required}")
 
     st.subheader("旅拍 & 婚礼 分项间接费用")
+    st.caption(
+        "⚠️ **「样片研发」只填新疆以外的拍样费用**；新疆拍样费用请走「🏜️ 新疆拍样/报销费用」单独导入。")
     cost_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资',
                   '售后服务工资','AI与数据中心工资','房租、水电、办公费等','税费及手续费',
                   '样片研发','场地铺设费','舆情处理']
@@ -4257,6 +4305,9 @@ def xinjiang_expense_import_page():
     st.header("🏜️ 新疆拍样/报销费用导入（间接成本）")
     module_name = "🏜️ 新疆费用导入"
     can_see = has_permission(module_name, st.session_state.role)
+    st.info(
+        "**这一页只导新疆的拍样费/报销费。** 新疆以外的拍样费用请到「📈 录入间接成本」页，"
+        "填在「样片研发」项下——两处不要混填，否则会重复计算或漏算。", icon="ℹ️")
     st.markdown("""
     **说明**：  
     - 上传 Excel 文件，需包含列：`期间`（如 2026-07）、`费用项`、`金额`。  
@@ -4907,6 +4958,19 @@ def analyze_salary_change(curr_period, base_period):
     finally:
         db.close()
 
+# ============================================================================
+# 【已下线】新疆拍摄费用导入（2026-09 起不再使用）
+# ----------------------------------------------------------------------------
+# 停用原因：新疆账单后期不再需要系统解析，人工整理好的数据已是可直接使用的格式，
+#           统一走「拍摄费用账单」导入即可。
+# 核验结论（停用前已逐项比对，两页功能完全等价）：
+#   - 写入的费用项一致：cost_item 均为 '拍摄费用'
+#   - 重复处理选项一致：覆盖 / 仅导入新记录 / 合并金额
+#   - 明细列支持一致：基础金额、餐费、仪式补助、住宿、赠送、仪式、上山补助、景点1~4、减费用
+#   - 覆盖率检查一致：均调用 render_shoot_coverage_check()
+# 因此本函数保留代码但不挂任何入口（原本也从未挂过菜单）。如需恢复，
+# 在 route 分支里加一行 elif 指向它即可。
+# ============================================================================
 def xinjiang_shooting_import_page():
     st.markdown("### 📸 新疆拍摄费用导入")
     module_name = "📥 账单导入"
@@ -5522,9 +5586,11 @@ def log_view_page():
     db.close()
 
 # 会话超时强制登出（加固）：登录态存在但超过 SESSION_TIMEOUT 则登出
+# 已并入 _auth.check_session_timeout()（顶部调用），此处保留原逻辑位置说明。
 if st.session_state.get('logged_in') and (time.time() - st.session_state.get('_login_ts', 0)) > SESSION_TIMEOUT:
     st.session_state.logged_in = False
     st.session_state._login_ts = 0
+    _auth.clear_login()
     st.rerun()
 
 # 主入口
@@ -5532,7 +5598,10 @@ if not st.session_state.logged_in:
     login_page()
 else:
     menu = main_sidebar()
-    if menu == "📊 生成利润表": profit_report_page()
+    if menu == "🏠 工作台": workbench_page()
+    elif menu == "📥 数据导入中心":
+        _ic_css(); import_center_page()
+    elif menu == "📊 生成利润表": profit_report_page()
     elif menu == "📁 利润表历史": view_profit_history_page()
     elif menu == "📥 导入收入数据": import_income_page()
     elif menu == "📊 导入运营成本": import_operation_cost_page()
