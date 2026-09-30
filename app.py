@@ -1012,9 +1012,70 @@ def view_profit_history_page():
         unsafe_allow_html=True)
 
     # ==================== 主要费用项均价 ====================
+    # ⚠️ 口径修正（2026-09-30）：
+    #   原实现用「费用合计 ÷ 该区间全部订单数」算单均，在费用只覆盖部分订单时是错的。
+    #   实测 2026年1-8月：鲜花费用仅 19 单产生，却除以 3306 单，单均从 ¥352.63 被
+    #   摊薄成 ¥2.03（差 174 倍）；微电影剪辑 700 单 vs 3306 单，¥417.16 → ¥88.33。
+    #   现改为「费用合计 ÷ 该费用项实际覆盖的订单数」——分母是"有这项支出的单"，
+    #   得到的是"有微电影的单，平均花多少微电影钱"，才是业务上有意义的单价。
+    #   完全覆盖的费用项（如拍摄费用 100%）两种算法结果一致，不受影响。
     st.markdown("<div class='ph-sec'>主要费用项均价</div>", unsafe_allow_html=True)
-    st.markdown("<div class='ph-hint'>按订单数分摊后的单均成本（元/单）。</div>",
-                unsafe_allow_html=True)
+    st.markdown(
+        "<div class='ph-hint'>均摊单数 = 该费用项实际产生的订单数。"
+        "只按「有这项支出的订单」计算单均，不全量摊薄。</div>",
+        unsafe_allow_html=True)
+
+    # 费用展示名 → actual_direct_cost.cost_item 原始名
+    _AVG_COST_ITEM = {
+        '拍摄费用': '拍摄费用',
+        '交付费用（场地）': '场地',
+        '交付费用（搭建）': '搭建',
+        '交付费用（主持）': '主持',
+        '鲜花费用': '鲜花费用',
+        '微电影拍摄费用': '微电影拍摄费用',
+        '二销选片费': '二销选片费',
+    }
+    # ⚠️ 必须按「全量订单」分摊的费用项（利润表口径下每单都有值，见 profit_engine.py）：
+    #   · 微电影剪辑费用：无实际记录时回退到标准成本 → 每单都有值
+    #   · 二销选片费：无实际记录时按「二销金额 × 45%」计算 → 每单都有值
+    #   这两项若拿实际覆盖单数当分母，会与分子的口径不一致，算出的单均偏高。
+    _FORCE_ALL_ORDERS = {'微电影剪辑费用', '二销选片费'}
+    # 一次性查出各费用项的覆盖订单数（限定当前月份区间）
+    _cover_map = {}
+    try:
+        _p_start = f"{sel_months[0]}-01"
+        _ey, _em = int(sel_months[-1][:4]), int(sel_months[-1][5:7])
+        _p_end = (pd.Timestamp(year=_ey, month=_em, day=1)
+                  + pd.offsets.MonthEnd(1)).strftime('%Y-%m-%d')
+        _cdb = SessionLocal()
+        try:
+            _q = (_cdb.query(ActualDirectCost.cost_item,
+                             func.count(func.distinct(ActualDirectCost.order_id)))
+                  .join(Order, Order.order_id == ActualDirectCost.order_id)
+                  .filter(Order.selection_date >= _p_start,
+                          Order.selection_date <= _p_end))
+            for _it, _cnt in _q.group_by(ActualDirectCost.cost_item).all():
+                _cover_map[_it] = int(_cnt)
+        finally:
+            _cdb.close()
+    except Exception:
+        _cover_map = {}
+
+    def _cover_of(col_name):
+        """该费用项应使用的均摊单数。
+
+        返回 (单数, 是否为部分覆盖)：
+          · 全量分摊项（微电影剪辑/二销选片费）→ (全单数, False)
+          · 有实际成本记录的项 → (实际覆盖单数, True)
+          · 查不到的项 → (全单数, False)
+        """
+        if col_name in _FORCE_ALL_ORDERS:
+            return _orders, False
+        _item = _AVG_COST_ITEM.get(col_name)
+        if _item and _cover_map.get(_item):
+            return _cover_map[_item], True
+        return _orders, False
+
     _avg_src = [('拍摄费用', '摄影师/化妆师/助理团队'),
                 ('推广费用（实际）', '线上线下推广投放'),
                 ('交付费用（场地）', '婚礼及旅拍场地租赁'),
@@ -1034,21 +1095,26 @@ def view_profit_history_page():
         _v = float(vdf[_n].sum())
         if _v <= 0:
             continue
-        _avg = _v / _orders if _orders else 0.0
+        _cov, _is_item = _cover_of(_n)
+        _avg = _v / _cov if _cov else 0.0
+        # 有明确成本项来源的标注覆盖单数；否则标注为全量（该费用项按订单数分摊）
+        _cov_txt = f"{_cov:,} 单" if _is_item else f"{_cov:,} 单·全量"
         _arows.append(
             "<tr>"
             f"<td class='l'>{_n}</td>"
             f"<td style='width:130px'>¥{_avg:,.2f}</td>"
+            f"<td style='width:120px;color:#8a9aaa'>{_cov_txt}</td>"
             f"<td style='width:130px'>{_ph_fmt(_v)}</td>"
-            f"<td class='l' style='color:#8a9aaa;font-size:12.5px;width:250px'>{_d}</td>"
+            f"<td class='l' style='color:#8a9aaa;font-size:12.5px;width:220px'>{_d}</td>"
             "</tr>")
     if _arows:
         st.markdown(
             "<div class='ph-tb'><table>"
             "<thead><tr><th class='l'>费用项</th>"
             "<th style='width:130px'>单均</th>"
+            "<th style='width:120px'>均摊单数</th>"
             "<th style='width:130px'>合计</th>"
-            "<th class='l' style='width:250px'>说明</th></tr></thead>"
+            "<th class='l' style='width:220px'>说明</th></tr></thead>"
             "<tbody>" + "".join(_arows) + "</tbody></table></div>",
             unsafe_allow_html=True)
     else:
@@ -1073,6 +1139,8 @@ def view_profit_history_page():
             continue
         _v = float(vdf[_c].sum())
         _shsum += _v
+        # 单均分母：优先用该费用项实际覆盖的订单数（见「主要费用项均价」处口径说明）
+        _cov_s, _ = _cover_of(_c)
         # ⚠️ 注意：append 的结果是 None，不能参与字符串拼接。
         #    原先写成 `_shrows.append(...) if _orders else None`，会在 _orders 为真时
         #    把 append 的返回值 None 拼进 HTML，页面上出现 9 个 "None"。
@@ -1080,19 +1148,21 @@ def view_profit_history_page():
             "<tr>"
             f"<td class='l'>{_d}</td>"
             f"<td style='width:140px'>{_u}{_v:,.2f}</td>"
-            f"<td style='width:110px'>¥{(_v / _orders) if _orders else 0:,.2f}</td>"
+            f"<td style='width:110px'>¥{(_v / _cov_s) if _cov_s else 0:,.2f}</td>"
+            f"<td style='width:110px;color:#8a9aaa'>{_cov_s:,} 单</td>"
             "</tr>")
     if _shrows:
         st.markdown(
             "<div class='ph-tb'><table>"
             "<thead><tr><th class='l'>明细项目</th>"
             "<th style='width:140px'>合计金额</th>"
-            "<th style='width:110px'>单均</th></tr></thead>"
+            "<th style='width:110px'>单均</th>"
+            "<th style='width:110px'>均摊单数</th></tr></thead>"
             "<tbody>" + "".join(_shrows) +
             f"<tr style='background:#f8fafc;font-weight:700'>"
             f"<td class='l'>拍摄相关合计</td>"
             f"<td>¥{_shsum:,.2f}</td>"
-            f"<td>¥{(_shsum / _orders) if _orders else 0:,.2f}</td></tr>"
+            f"<td colspan='2'>各费用项单均见上行</td></tr>"
             "</tbody></table></div>",
             unsafe_allow_html=True)
 
@@ -1109,23 +1179,26 @@ def view_profit_history_page():
             continue
         _v = float(vdf[_c].sum())
         _dlsum += _v
+        _cov_d, _ = _cover_of(_c)
         _dlrows.append(
             "<tr>"
             f"<td class='l'>{_d}</td>"
             f"<td style='width:140px'>¥{_v:,.2f}</td>"
-            f"<td style='width:110px'>¥{(_v / _orders) if _orders else 0:,.2f}</td>"
+            f"<td style='width:110px'>¥{(_v / _cov_d) if _cov_d else 0:,.2f}</td>"
+            f"<td style='width:110px;color:#8a9aaa'>{_cov_d:,} 单</td>"
             "</tr>")
     if _dlrows:
         st.markdown(
             "<div class='ph-tb'><table>"
             "<thead><tr><th class='l'>明细项目</th>"
             "<th style='width:140px'>合计金额</th>"
-            "<th style='width:110px'>单均</th></tr></thead>"
+            "<th style='width:110px'>单均</th>"
+            "<th style='width:110px'>均摊单数</th></tr></thead>"
             "<tbody>" + "".join(_dlrows) +
             f"<tr style='background:#f8fafc;font-weight:700'>"
             f"<td class='l'>交付费用合计</td>"
             f"<td>¥{_dlsum:,.2f}</td>"
-            f"<td>¥{(_dlsum / _orders) if _orders else 0:,.2f}</td></tr>"
+            f"<td colspan='2'>各费用项单均见上行</td></tr>"
             "</tbody></table></div>",
             unsafe_allow_html=True)
 
