@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 # 让本文件能 import 同目录下的原系统模块
@@ -123,7 +124,14 @@ def _wb_query_month(period: str) -> dict:
                                  Order.selection_date >= s, Order.selection_date <= e)))
                          .scalar() or 0)
 
-        # 拍摄费用覆盖率（用于待办提醒）
+        # 酒店房差统计（用于待办提醒）
+        # 口径说明（2026-09 业务确认）：
+        #   酒店供应商包 2 晚，超出部分的房差由公司承担，属于成本；
+        #   旺季还要额外补房差（按月份，如新疆 6/7 月 +230/晚）；
+        #   "减费用"里的住宿返还（如 8980 套餐少含一晚退 150）已在结算金额中抵扣，
+        #   不需要单独计算。
+        # 所以这里统计的是【实际产生的房差】，而不是"有多少单含酒店"——
+        # 酒店成本在业务上不是"有/没有"的问题，而是"房差多少"的问题。
         from database import ActualDirectCost as ADC
         cur_ids = [o[0] for o in db.query(Order.order_id).filter(
             Order.selection_date >= start, Order.selection_date <= end).all()]
@@ -131,10 +139,24 @@ def _wb_query_month(period: str) -> dict:
         if cur_ids:
             shoot_rows = db.query(ADC).filter(
                 ADC.cost_item == '拍摄费用', ADC.order_id.in_(cur_ids)).all()
-        hotel_orders = 0
+        hotel_orders = 0          # 产生房差的订单数
+        hotel_total = 0.0         # 房差合计
+        hotel_hotel = 0.0         # 其中酒店（备注写"酒店"）
+        hotel_minsu = 0.0         # 其中民宿（备注写"民宿"）
         for rec in shoot_rows:
-            if rec.remark and '酒店成本' in rec.remark:
-                hotel_orders += 1
+            if not rec.remark or '酒店成本' not in rec.remark:
+                continue
+            m = re.search(r'酒店成本[:：]\s*([\d.]+)', rec.remark)
+            amt = float(m.group(1)) if m else 0.0
+            if amt <= 0:
+                continue
+            hotel_orders += 1
+            hotel_total += amt
+            raw = rec.remark.split('||')[0]
+            if '民宿' in raw:
+                hotel_minsu += amt
+            else:
+                hotel_hotel += amt
 
         return {
             'period': period,
@@ -145,6 +167,9 @@ def _wb_query_month(period: str) -> dict:
             'cur_direct': direct(start, end),
             'hotel_orders': hotel_orders,
             'hotel_cover': (hotel_orders / cur_cnt * 100) if cur_cnt else 0,
+            'hotel_total': hotel_total,
+            'hotel_hotel': hotel_hotel,
+            'hotel_minsu': hotel_minsu,
             'shoot_records': len(shoot_rows),
         }
     finally:
@@ -240,8 +265,8 @@ def workbench_page():
                 delta_color="inverse")
     c[1].metric("📉 直接成本", fmt(d['cur_direct']))
     c[2].metric("📦 订单总数", f"{d['cur_cnt']:,}", pct(d['cur_cnt'], d['prev_cnt']))
-    c[3].metric("🏨 酒店覆盖率", f"{d['hotel_cover']:.1f}%",
-                f"{d['hotel_orders']} 单含酒店")
+    c[3].metric("🏨 酒店房差", fmt(d['hotel_total']),
+                f"{d['hotel_orders']} 单产生房差")
 
     # ---- 常用入口 ----
     st.markdown("<div class='wb-sec'>⚡ 常用入口</div>", unsafe_allow_html=True)
@@ -259,16 +284,24 @@ def workbench_page():
 
     with left:
         st.markdown("<div class='wb-sec'>🔔 待办提醒</div>", unsafe_allow_html=True)
-        if d['hotel_cover'] < 18:
+        if d['hotel_orders'] > 0:
+            _sub = []
+            if d['hotel_hotel'] > 0:
+                _sub.append(f"酒店 ¥{d['hotel_hotel']:,.0f}")
+            if d['hotel_minsu'] > 0:
+                _sub.append(f"民宿 ¥{d['hotel_minsu']:,.0f}")
+            _sub_txt = ("（" + " + ".join(_sub) + "）") if _sub else ""
             st.markdown(
-                f"<div class='wb-alert'>⚠️ <b>酒店成本覆盖率偏低</b><br>"
-                f"{period} 仅有 {d['hotel_orders']} 单（{d['hotel_cover']:.1f}%）"
-                f"产生了酒店成本，建议核实是否有漏录。</div>",
+                f"<div class='wb-ok'>🏨 <b>酒店房差</b>　{period} 共 "
+                f"<b>{d['hotel_orders']} 单</b>产生房差，合计 "
+                f"<b>{fmt(d['hotel_total'])}</b>{_sub_txt}。<br>"
+                f"<span style='opacity:.75'>房差由公司承担，属成本；"
+                f"住宿返还已在结算金额中抵扣。</span></div>",
                 unsafe_allow_html=True)
         else:
             st.markdown(
-                f"<div class='wb-ok'>✅ 酒店成本覆盖率 {d['hotel_cover']:.1f}%，"
-                f"处于正常水平。</div>", unsafe_allow_html=True)
+                f"<div class='wb-ok'>🏨 <b>酒店房差</b>　{period} 无房差产生。"
+                f"</div>", unsafe_allow_html=True)
         st.markdown(
             f"<div class='wb-ok'>✅ 拍摄费用已录入 {d['shoot_records']:,} 条。</div>",
             unsafe_allow_html=True)
