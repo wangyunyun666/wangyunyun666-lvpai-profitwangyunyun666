@@ -5,6 +5,58 @@ from database import SessionLocal, Order, SetStandardCost, ActualDirectCost, Che
 from sqlalchemy import func
 from streamlit import cache_data
 
+# ==================== 内部单剔除 ====================
+# 「一纸情书」系列为公司内部单，不属于真实经营业务，不参与任何利润计算。
+# 之所以用「套系名关键字」而不是「type=='nan'」来判定，是因为 type 列存成了字符串 "nan"
+# 只是当初导入时类型列留空、被 str(row['类型']) 转义的结果，它并非这批内部单的稳定标识；
+# 而套系名「一纸情书」才是业务上可靠的唯一标识。同时这批订单的存在会导致业务线筛选出现 "nan" 选项。
+EXCLUDE_SET_KEYWORDS = ('一纸情书',)
+
+
+def is_excluded_order(set_name):
+    """判断订单是否为内部单（不参与利润计算）。
+
+    Args:
+        set_name: 订单的套系名称，可能为 None。
+
+    Returns:
+        bool: 命中任一内部单关键字则返回 True。
+    """
+    if not set_name:
+        return False
+    return any(kw in str(set_name) for kw in EXCLUDE_SET_KEYWORDS)
+
+
+def _valid_biz_type(t):
+    """type 是否为有效业务类型（旅拍/婚礼）。
+
+    Args:
+        t: 订单的 type（业务类型）字段，可能为 None 或脏字符串 'nan'。
+
+    Returns:
+        bool: 仅当去空格后严格等于 '旅拍' 或 '婚礼' 时返回 True。
+    """
+    s = str(t or '').strip()
+    return s in ('旅拍', '婚礼')
+
+
+def infer_type_from_set(set_name):
+    """按套系名关键字推断业务类型；推断不出返回 None。
+
+    Args:
+        set_name: 订单的套系名称，可能为 None。
+
+    Returns:
+        str | None: 命中「婚礼」返回 '婚礼'，命中「旅拍」返回 '旅拍'，否则 None。
+    """
+    s = str(set_name or '')
+    if '婚礼' in s:
+        return '婚礼'
+    if '旅拍' in s:
+        return '旅拍'
+    return None
+
+
 @cache_data(ttl=600, show_spinner="正在生成利润报表…")
 def generate_profit_report(period_start, period_end, promo_mode='actual'):
     db = SessionLocal()
@@ -17,7 +69,24 @@ def generate_profit_report(period_start, period_end, promo_mode='actual'):
             func.date(Order.selection_date) >= start_date,
             func.date(Order.selection_date) <= end_date
         ).all()
-        orders = [o for o in orders if o.type and str(o.type).strip() != '']
+        # 先剔除「一纸情书」内部单。
+        # 注意：旧的 str(o.type).strip() != '' 对字符串 "nan" 是成立的（"nan" 不是空串），
+        # 因此单单靠 type 判空无法拦下这类脏数据，必须靠套系名关键字剔除内部单。
+        orders = [o for o in orders if not is_excluded_order(o.set_name)]
+        # 历史脏数据归一：type 缺失 / 为 'nan' 字符串的订单，按套系名推断业务类型。
+        # 这里只就地修正内存中的 SQLAlchemy ORM 对象属性（_o.type = _it），engine 内全程无 commit，
+        # 因此绝不会写库，仅影响本次报表口径。推断不出的订单无法归入任何业务线，予以排除，
+        # 否则会以 nan 业务类型混入利润表。
+        _fixed = []
+        for _o in orders:
+            if not _valid_biz_type(_o.type):
+                _it = infer_type_from_set(_o.set_name)
+                if _it:
+                    _o.type = _it
+                else:
+                    continue
+            _fixed.append(_o)
+        orders = _fixed
         order_ids = [o.order_id for o in orders]
         if not orders:
             return pd.DataFrame()
@@ -486,14 +555,29 @@ def generate_profit_report_multi_month(*period_months, promo_mode='actual'):
         else:
             end_date = datetime(y, m + 1, 1).date() - timedelta(days=1)
 
-        qty_rows = db.query(Order.type, func.count()).filter(
+        # 人工成本分摊的除数（选片订单数）。这里必须排除「一纸情书」内部单，否则基数偏大、人工成本被摊薄。
+        # 为什么把过滤放到 Python 层而不是 SQL：一是 SQL 的 NOT LIKE 对 set_name 为 NULL 的行会返回
+        # 未知值从而把正常订单也误删，二是 LIKE 关键字在不同方言下的转义行为有差异；取回后用
+        # is_excluded_order 判定，SQLite（本地）与 PostgreSQL（Neon 生产）行为完全一致。
+        _qty_rows = db.query(Order.type, Order.set_name).filter(
             Order.selection_date >= start_date,
             Order.selection_date <= end_date,
             Order.type.isnot(None),
             func.trim(Order.type) != ''
-        ).group_by(Order.type).all()
-        travel_qty = sum(c for t, c in qty_rows if t == '旅拍')
-        wedding_qty = sum(c for t, c in qty_rows if t == '婚礼')
+        ).all()
+        # 与单月报表口径保持一致：type 无效（缺失/为 'nan'）的订单按套系名推断业务类型后再计数；
+        # 推断不出业务类型的订单跳过（不计入 any 业务线除数），避免污染分摊。
+        travel_qty = 0
+        wedding_qty = 0
+        for _t, _s in _qty_rows:
+            if is_excluded_order(_s):
+                continue
+            _bt = _t if _valid_biz_type(_t) else infer_type_from_set(_s)
+            if _bt == '旅拍':
+                travel_qty += 1
+            elif _bt == '婚礼':
+                wedding_qty += 1
+            # 推断仍无结果的订单：无业务线归属，跳过
 
         travel_order_cnt = 0.0
         wedding_order_cnt = 0.0

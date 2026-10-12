@@ -10,7 +10,7 @@ from workbench import workbench_page, _wb_handle_goto
 from import_center import import_center_page, inject_ic_css as _ic_css
 import auth_persist as _auth
 from database import SessionLocal, User, Order, SetStandardCost, ActualDirectCost, CherryProductCost, IndirectCost, AllocationRule, OperationLog, MonthlyStats, ModulePermission, ProfitSnapshot, EmployeeSalary
-from profit_engine import generate_profit_report, generate_profit_report_multi_month
+from profit_engine import generate_profit_report, generate_profit_report_multi_month, is_excluded_order
 from sqlalchemy import func
 from werkzeug.security import generate_password_hash, check_password_hash
 import re
@@ -49,7 +49,7 @@ SET_TYPE_MAP = {
     "丽江小发哥专属12520": "旅拍", "丽江小发哥专属16980": "旅拍", "大理小发哥专属16980": "旅拍",
     "新疆特惠8980": "旅拍", "新疆网红款10980": "旅拍", "新疆高定款12980": "旅拍",
     "13980丽江婚礼": "婚礼", "16980丽江目的地婚礼": "婚礼", "16980丽江婚礼": "婚礼",
-    "13980丽江婚礼套系": "婚礼", "19980丽江婚礼": "婚礼", "16980大理婚礼": "婚礼",
+    "13980丽江婚礼套系": "婚礼", "14980丽江婚礼套系": "婚礼", "19980丽江婚礼": "婚礼", "16980大理婚礼": "婚礼",
     "19980大理婚礼": "婚礼", "19980丽江目的地婚礼": "婚礼", "16980丽江目的地": "婚礼",
     "29980丽江目的地婚礼": "婚礼", "20980新疆婚礼": "婚礼", "14980大理婚礼": "婚礼",
     "16980新疆婚礼": "婚礼", "9999纯拍婚礼丽江": "婚礼",
@@ -819,8 +819,11 @@ def view_profit_history_page():
         unsafe_allow_html=True)
 
     # ==================== 业务线筛选 ====================
+    # 业务线只保留有效值（旅拍/婚礼等）；'nan'、'None'、'空串' 这类脏值不展示成选项，
+    # 否则会出现一个没有任何业务含义的 "nan" 单选，用户选中后看到的是内部单/脏数据。
+    _invalid_biz = {'nan', 'none', 'null', 'nat', ''}
     _bizs = ['全部'] + sorted([b for b in df['业务类型'].dropna().unique()
-                               if str(b).strip()],
+                               if str(b).strip() and str(b).strip().lower() not in _invalid_biz],
                               key=lambda x: 0 if '旅拍' in str(x) else 1)
     _biz = st.radio("业务线", _bizs, horizontal=True, key='ph_biz')
 
@@ -1232,6 +1235,159 @@ def view_profit_history_page():
             "</tbody></table></div>",
             unsafe_allow_html=True)
 
+    # ==================== 导出 HTML 报告（单文件、离线可开）====================
+    # 数据全部在服务端渲染进 HTML，不依赖 JS / 网络 —— 文件发给谁都能完整打开，
+    # 不会出现独立打开时指标卡变 0/undefined 的问题。
+    def _exp_wan(v):
+        """≥1万 显示万元，否则显示元。"""
+        v = float(v)
+        return f"{v / 10000:,.2f}万" if abs(v) >= 10000 else f"{v:,.2f}"
+
+    def _build_profit_history_html(src, span, ml, biz):
+        """把当前筛选结果渲染成完整独立 HTML 报告。"""
+        _inc = float(src['总收入'].sum())
+        _prof = float(src['利润合计'].sum())
+        _rate = (_prof / _inc * 100) if _inc else 0.0
+        _units = int(src['套系数量'].sum())
+        _profit_color = '#c0392b' if _prof >= 0 else '#27ae60'
+        _gen_at = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+        # —— 排行榜行 ——
+        _rk = []
+        for _i, _r in src.iterrows():
+            _p = float(_r['利润合计']); _ri = float(_r['总收入'])
+            _rr = (_p / _ri * 100) if _ri else 0.0
+            _c = '#c0392b' if _p >= 0 else '#27ae60'
+            _rk.append(
+                "<tr>"
+                f"<td>{_i + 1}</td><td class='l'>{_ph_esc(_r['业务类型'])}</td>"
+                f"<td class='l'>{_ph_esc(_r['套系'])}</td>"
+                f"<td>{int(_r['套系数量']):,}</td>"
+                f"<td>{_exp_wan(_ri)}</td>"
+                f"<td>{_exp_wan(_r['二销金额']) if '二销金额' in src.columns else '—'}</td>"
+                f"<td style='color:{_c};font-weight:600'>{_exp_wan(_p)}</td>"
+                f"<td style='color:{_c}'>{_rr:.2f}%</td>"
+                "</tr>")
+
+        # —— 费用结构行 ——
+        _fee_rows = []
+        _fee_total = 0.0
+        for _n, _d in _FEE:
+            if _n not in src.columns:
+                continue
+            _v = float(src[_n].sum())
+            if _v <= 0:
+                continue
+            _fee_total += _v
+            _fee_rows.append(
+                f"<tr><td class='l'>{_n}</td>"
+                f"<td>{_exp_wan(_v)}</td>"
+                f"<td>{(_v / _inc * 100) if _inc else 0:.2f}%</td></tr>")
+
+        _dc = float(src['总直接成本'].sum()) if '总直接成本' in src.columns else 0.0
+        _ic = float(src['总间接成本'].sum()) if '总间接成本' in src.columns else 0.0
+
+        return f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>利润表历史报告 | {span}</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  background:#f5f7fa;color:#2c3e50;padding:24px 14px}}
+.wrap{{max-width:960px;margin:0 auto}}
+.hd{{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;border-radius:16px;
+  padding:24px 28px;margin-bottom:14px;box-shadow:0 6px 20px rgba(102,126,234,.22)}}
+.hd h1{{font-size:22px;margin-bottom:8px}}
+.hd .meta{{opacity:.92;font-size:13px;line-height:1.8}}
+.mode{{background:#fff;border:1px solid #e8ecf1;border-radius:12px;padding:10px 16px;
+  font-size:12.5px;color:#7a8a9a;line-height:1.7;margin-bottom:16px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:13px;margin-bottom:18px}}
+.card{{background:#fff;border:1px solid #e8ecf1;border-radius:14px;padding:16px 18px;
+  box-shadow:0 2px 8px rgba(44,62,80,.05)}}
+.card .k{{font-size:12px;color:#7a8a9a;margin-bottom:7px}}
+.card .v{{font-size:22px;font-weight:700}}
+.sec{{font-size:15px;font-weight:700;margin:22px 0 10px;padding-left:11px;
+  border-left:4px solid #667eea}}
+.tb{{background:#fff;border:1px solid #e8ecf1;border-radius:14px;overflow-x:auto;
+  box-shadow:0 2px 8px rgba(44,62,80,.05)}}
+table{{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}}
+th{{background:#f8fafc;color:#5a6a7a;font-weight:600;font-size:12.5px;padding:11px 14px;
+  text-align:right;border-bottom:1px solid #e8ecf1}}
+th.l{{text-align:left}}
+td{{padding:10px 14px;text-align:right;border-bottom:1px solid #f2f5f8}}
+td.l{{text-align:left}}
+tr:hover td{{background:#fafbfd}}
+tfoot td{{padding:12px 14px;text-align:right;background:#f8fafc;font-weight:700;
+  border-top:2px solid #667eea}}
+tfoot td.l{{text-align:left}}
+.up{{color:#c0392b}}.down{{color:#27ae60}}
+.ft{{text-align:center;font-size:12px;color:#95a5b6;margin-top:24px;line-height:1.8}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hd">
+    <h1>利润表历史报告</h1>
+    <div class="meta">数据区间：{span}　·　共 {len(src)} 个套系 / {_units:,} 单<br>
+    费用口径：{ml}　·　业务线：{biz}</div>
+  </div>
+  <div class="mode">{ml} —— {'人工、推广费按下单订单数分摊到各套系，用于评估套系定价合理性。'
+    if ml == '分摊口径' else '只统计实际发生的费用，未分摊的固定成本不纳入，反映真实现金流成本。'}</div>
+  <div class="cards">
+    <div class="card"><div class="k">套系总数</div><div class="v">{len(src)}</div></div>
+    <div class="card"><div class="k">订单总数</div><div class="v">{_units:,}</div></div>
+    <div class="card"><div class="k">总收入</div><div class="v">{_exp_wan(_inc)}</div></div>
+    <div class="card"><div class="k">利润合计</div>
+      <div class="v" style="color:{_profit_color}">{_exp_wan(_prof)}</div></div>
+    <div class="card"><div class="k">整体利润率</div>
+      <div class="v" style="color:{_profit_color}">{_rate:.2f}%</div>
+      <div class="k" style="margin-top:5px">{ml} · 利润 ÷ 收入</div></div>
+  </div>
+  <div class="sec">套系利润排行榜</div>
+  <div class="hint" style="font-size:12.5px;color:#95a5b6;margin:0 0 10px 15px">
+    按利润合计降序。红色=盈利（中国习惯），绿色=亏损。</div>
+  <div class="tb"><table>
+    <thead><tr><th>#</th><th class="l">业务线</th><th class="l">套系</th>
+      <th>单数</th><th>收入</th><th>二销</th><th>利润</th><th>利润率</th></tr></thead>
+    <tbody>{''.join(_rk) or '<tr><td colspan="8" style="text-align:center;color:#95a5b6">无数据</td></tr>'}</tbody>
+    <tfoot><tr><td colspan="3" class="l">合计 {len(src)} 个套系</td>
+      <td>{_units:,}</td><td>{_exp_wan(_inc)}</td><td>—</td>
+      <td style="color:{_profit_color}">{_exp_wan(_prof)}</td>
+      <td style="color:{_profit_color}">{_rate:.2f}%</td></tr></tfoot>
+  </table></div>
+  <div class="sec">费用结构</div>
+  <div class="tb"><table>
+    <thead><tr><th class="l">费用项</th><th>金额</th><th>占收入</th></tr></thead>
+    <tbody>{''.join(_fee_rows) or '<tr><td colspan="3" style="text-align:center;color:#95a5b6">无费用数据</td></tr>'}</tbody>
+    <tfoot><tr><td class="l">费用合计</td><td>{_exp_wan(_fee_total)}</td>
+      <td>{(_fee_total / _inc * 100) if _inc else 0:.2f}%</td></tr></tfoot>
+  </table></div>
+  <div class="sec">成本与利润结构</div>
+  <div class="tb"><table>
+    <thead><tr><th class="l">项目</th><th>金额</th><th>占收入</th></tr></thead>
+    <tbody>
+      <tr><td class="l">总直接成本</td><td>{_exp_wan(_dc)}</td>
+        <td>{(_dc / _inc * 100) if _inc else 0:.2f}%</td></tr>
+      <tr><td class="l">总间接成本</td><td>{_exp_wan(_ic)}</td>
+        <td>{(_ic / _inc * 100) if _inc else 0:.2f}%</td></tr>
+      <tr><td class="l">利润合计</td><td style="color:{_profit_color};font-weight:600">{_exp_wan(_prof)}</td>
+        <td style="color:{_profit_color}">{_rate:.2f}%</td></tr>
+    </tbody>
+  </table></div>
+  <div class="ft">本报告由「旅拍利润系统」生成 · 数据区间 {span} · {ml}<br>
+  生成时间：{_gen_at} · 单文件离线可开，可直接转发</div>
+</div>
+</body>
+</html>"""
+
+    _export_html = _build_profit_history_html(vdf, _span_txt, mode_label, _biz)
+    st.download_button(
+        "📥 导出 HTML 报告", _export_html.encode('utf-8'),
+        f"利润表历史报告_{_span_txt}_{mode_label}_{_biz}.html", "text/html")
+
     # ==================== 历史快照（保留原功能）====================
     st.markdown("<div class='ph-sec'>历史快照</div>", unsafe_allow_html=True)
 
@@ -1421,6 +1577,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
             .all()
         )
         for oid, sel_date, set_name, otype in micro_rows:
+            # 「一纸情书」内部单不计入微电影订单数，否则会把内部单当作旅拍订单、放大 微电影拍摄费用的除数
+            if is_excluded_order(set_name):
+                continue
             if sel_date and period_start <= sel_date <= period_end:
                 if '新疆' in (set_name or ''):
                     micro_xinjiang_oids.add(oid)
@@ -1439,6 +1598,10 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
         ).all()
         erxiao_travel_cnt = erxiao_wedding_cnt = erxiao_xinjiang_cnt = 0
         for _oid, _otype, _sname in erxiao_rows:
+            # 「一纸情书」内部单不计入二销选片数：它们的 type 是 'nan'，会被下面的 else 归入旅拍，
+            # 从而把二销选片数除数算大，影响到 二销选片费/工厂费用(二销)/后期修片费(二销) 的均价。
+            if is_excluded_order(_sname):
+                continue
             # 业务类型与地区是两个独立维度（新疆订单既可能属旅拍、也可能属婚礼），
             # 因此新疆必须独立累加、不与上面互斥，否则新疆口径恒为 0。
             if _otype == '婚礼':
@@ -1461,6 +1624,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                 _db.close()
             _travel = _wedding = _xj = 0
             for _t, _s in _rows:
+                # 与上方本期间口径保持一致：先剔除「一纸情书」内部单，避免同比/环比除数被内部单污染
+                if is_excluded_order(_s):
+                    continue
                 if _t == '婚礼':
                     _wedding += 1
                 else:
@@ -1858,11 +2024,13 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                 micro_oids_lm = [r[0] for r in micro_records_lm]
                                 if micro_oids_lm:
                                     if biz_type == "全部业务":
-                                        lm_micro_orders = db_lm_micro.query(Order).filter(
+                                        # 取回订单对象后剔除「一纸情书」内部单，与本期微电影订单数口径保持一致
+                                        _lm_micro_objs = db_lm_micro.query(Order).filter(
                                             Order.order_id.in_(micro_oids_lm),
                                             Order.selection_date >= last_month_start,
                                             Order.selection_date <= last_month_end
-                                        ).count()
+                                        ).all()
+                                        lm_micro_orders = sum(1 for o in _lm_micro_objs if not is_excluded_order(o.set_name))
                                     elif biz_type == "新疆":
                                         lm_micro_orders = db_lm_micro.query(Order).filter(
                                             Order.order_id.in_(micro_oids_lm),
@@ -1949,45 +2117,48 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                "建议对照页面顶部的订单总数一同判断。")
                     db2 = SessionLocal()
                     if biz_type == "全部业务":
-                        biz_orders = db2.query(Order.order_id).filter(
+                        # 取 order_id 的同时取 set_name，用于剔除「一纸情书」内部单：
+                        # 该分支不带 type 条件，会把内部单一并算入 拍摄费用 分子及其订单数除数，导致均价失真。
+                        biz_orders = db2.query(Order.order_id, Order.set_name).filter(
                             Order.selection_date >= period_start,
                             Order.selection_date <= period_end
                         ).all()
                     elif biz_type == '新疆':
-                        biz_orders = db2.query(Order.order_id).filter(
+                        biz_orders = db2.query(Order.order_id, Order.set_name).filter(
                             Order.set_name.contains('新疆'),
                             Order.selection_date >= period_start,
                             Order.selection_date <= period_end
                         ).all()
                     else:
-                        biz_orders = db2.query(Order.order_id).filter(
+                        biz_orders = db2.query(Order.order_id, Order.set_name).filter(
                             Order.type == biz_type,
                             Order.selection_date >= period_start,
                             Order.selection_date <= period_end
                         ).all()
-                    biz_order_ids = [o[0] for o in biz_orders]
+                    biz_order_ids = [o[0] for o in biz_orders if not is_excluded_order(o[1])]
                     shoot_records = db2.query(ActualDirectCost).filter(
                         ActualDirectCost.cost_item == '拍摄费用',
                         ActualDirectCost.order_id.in_(biz_order_ids)
                     ).all()
                     if last_month_start and last_month_end:
                         if biz_type == "全部业务":
-                            lm_orders = db2.query(Order.order_id).filter(
+                            lm_orders = db2.query(Order.order_id, Order.set_name).filter(
                                 Order.selection_date >= last_month_start,
                                 Order.selection_date <= last_month_end
                             ).all()
                         elif biz_type == '新疆':
-                            lm_orders = db2.query(Order.order_id).filter(
+                            lm_orders = db2.query(Order.order_id, Order.set_name).filter(
                                 Order.set_name.contains('新疆'),
                                 Order.selection_date >= last_month_start,
                                 Order.selection_date <= last_month_end
                             ).all()
                         else:
-                            lm_orders = db2.query(Order.order_id).filter(
+                            lm_orders = db2.query(Order.order_id, Order.set_name).filter(
                                 Order.type == biz_type,
                                 Order.selection_date >= last_month_start,
                                 Order.selection_date <= last_month_end
                             ).all()
+                        lm_orders = [o for o in lm_orders if not is_excluded_order(o[1])]
                         lm_order_ids = [o[0] for o in lm_orders]
                         lm_shoot_records = db2.query(ActualDirectCost).filter(
                             ActualDirectCost.cost_item == '拍摄费用',
@@ -2059,12 +2230,12 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                 Order.selection_date >= last_year_start,
                                 Order.selection_date <= last_year_end
                             ).all()
-                        ly_order_ids = [o.order_id for o in ly_orders]
+                        ly_order_ids = [o.order_id for o in ly_orders if not is_excluded_order(o.set_name)]
                         ly_records = db3.query(ActualDirectCost).filter(
                             ActualDirectCost.cost_item == '拍摄费用',
                             ActualDirectCost.order_id.in_(ly_order_ids)
                         ).all()
-                        ly_order_count = len(ly_orders)
+                        ly_order_count = len(ly_order_ids)
                         if ly_order_count > 0:
                             ly_detail, ly_total = build_detail_rows(ly_records, ly_order_count)
                             ly_shoot_avg = ly_total / ly_order_count
@@ -2805,6 +2976,27 @@ def import_income_page():
         df = df.dropna(subset=['订单号'])
         
         df["类型"] = df["套系"].map(SET_TYPE_MAP)
+        # 兜底：映射表没有的套系，按套系名关键字推断业务类型，避免 NaN 被存成字符串 "nan"。
+        # 为什么需要：历史上 str(NaN) = 'nan' 会被直接写入 type 字段，导致利润表出现
+        # 业务类型为 'nan' 的行。这里在入库前把能推断的补全，推断不出的也只置空。
+        def _infer_type(set_name):
+            s = str(set_name)
+            if '婚礼' in s:
+                return '婚礼'
+            if '旅拍' in s:
+                return '旅拍'
+            return None
+
+        # _missing_sets：所有不在标准映射表中的套系名（无论能否推断），提示用户核对并补映射；
+        # _uninferable：连关键字都推断不出、最终仍为空类型的套系名，单独提示将按空类型处理。
+        _missing_sets = sorted(set(df.loc[df['类型'].isna(), '套系'].astype(str)))
+        df['类型'] = df['类型'].fillna(df['套系'].map(_infer_type))
+        if _missing_sets:
+            st.warning('以下套系不在标准类型映射表中，已按套系名自动推断业务类型，请核对：' + '、'.join(_missing_sets))
+        # 推断与映射后仍为空的套系：无法归入任何业务线，将按空类型处理（不参与利润计算）
+        _uninferable = sorted(set(df.loc[df['类型'].isna(), '套系'].astype(str)))
+        if _uninferable:
+            st.warning('以下套系无法推断业务类型，将按空类型处理（不参与利润计算）：' + '、'.join(_uninferable))
         for col in ['套系金额','二销金额','客诉退款金额','拍照','照片']:
             if col not in df.columns:
                 df[col] = 0
@@ -2850,7 +3042,11 @@ def import_income_page():
             records.append({
                 '订单号': oid,
                 '套系': str(row['套系']).strip(),
-                '类型': str(row['类型']),
+                # 只有当类型确实有值（非 NaN、非空白）时才写入字符串，否则写空串。
+                # 为什么：历史 bug 里 str(NaN) 会得到字符串 'nan' 混入库存；这里保证任何
+                # 路径都不会再把 'nan'/'None' 字符串写进 type 字段。同一 r['类型'] 也被
+                # 下方「覆盖已有记录」分支的 existing.type 复用，故此处修复两处生效。
+                '类型': (str(row['类型']).strip() if pd.notna(row['类型']) and str(row['类型']).strip() else ''),
                 '套系金额': float(row['套系金额']),
                 '二销金额': float(row['二销金额']),
                 '客诉退款金额': float(row['客诉退款金额']),
