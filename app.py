@@ -967,44 +967,59 @@ def view_profit_history_page():
 
     # ==================== 费用结构 ====================
     st.markdown("<div class='ph-sec'>费用结构</div>", unsafe_allow_html=True)
-    st.markdown("<div class='ph-hint'>各费用项合计金额与占直接成本比重。</div>",
+    st.markdown("<div class='ph-hint'>各费用项合计金额与占直接成本比重。"
+                "<b>直接成本</b>＝拍摄、推广、交付(主持/场地/搭建)、鲜花、微电影拍摄与剪辑、"
+                "二销选片、像素蛋糕、后期修片(一销/二销)、工厂(一销/二销)、人工成本(7部门工资)；"
+                "<b>间接成本</b>＝房租水电办公、税费及手续费、样片研发、场地铺设、舆情处理。"
+                "占比列统一以总直接成本为基数，便于横向比较。</div>",
                 unsafe_allow_html=True)
 
+    # 类别：D = 直接成本，I = 间接成本（与 profit_engine 口径一致）
     _FEE = [
-        ('拍摄费用', '摄影师、化妆师、助理等团队费用，占比最大'),
-        ('推广费用（实际）', '线上线下广告投放、推广活动'),
-        ('交付费用（主持）', '婚礼主持费用，仅婚礼订单产生'),
-        ('交付费用（场地）', '婚礼及旅拍场地租赁费，含自租场地'),
-        ('交付费用（搭建）', '婚礼现场搭建布置费用'),
-        ('鲜花费用', '婚礼鲜花布置及手捧花等'),
-        ('微电影拍摄费用', '微电影前期拍摄团队成本'),
-        ('微电影剪辑费用', '微电影后期剪辑成本'),
-        ('二销选片费', '门店二销结算费用，按选片金额提成'),
-        ('像素蛋糕修图费', '第三方修图服务费'),
-        ('后期修片费(一销)', '一销订单后期修片成本'),
-        ('后期修片费(二销)', '二销订单后期修片成本'),
-        ('工厂费用（一销）', '相册、相框等工厂制作费（一销）'),
-        ('工厂费用（二销）', '相册、相框等工厂制作费（二销）'),
-        ('人工成本', '员工薪酬分摊（按订单数）'),
-        ('房租、水电、办公费等', '固定运营成本分摊'),
-        ('税费及手续费', '平台手续费、税费'),
-        ('样片研发', '样片拍摄与研发投入'),
-        ('场地铺设费', '场地建设与铺设投入'),
-        ('舆情处理', '口碑维护与客诉处理'),
+        ('拍摄费用', 'D', '摄影师、化妆师、助理等团队费用，占比最大'),
+        ('推广费用（实际）', 'D', '线上线下广告投放、推广活动（计入直接成本）'),
+        ('交付费用（主持）', 'D', '婚礼主持费用，仅婚礼订单产生'),
+        ('交付费用（场地）', 'D', '婚礼及旅拍场地租赁费，含自租场地'),
+        ('交付费用（搭建）', 'D', '婚礼现场搭建布置费用'),
+        ('鲜花费用', 'D', '婚礼鲜花布置及手捧花等'),
+        ('微电影拍摄费用', 'D', '微电影前期拍摄团队成本'),
+        ('微电影剪辑费用', 'D', '微电影后期剪辑成本'),
+        ('二销选片费', 'D', '门店二销结算费用，按选片金额提成'),
+        ('像素蛋糕修图费', 'D', '第三方修图服务费'),
+        ('后期修片费(一销)', 'D', '一销订单后期修片成本'),
+        ('后期修片费(二销)', 'D', '二销订单后期修片成本'),
+        ('工厂费用（一销）', 'D', '相册、相框等工厂制作费（一销）'),
+        ('工厂费用（二销）', 'D', '相册、相框等工厂制作费（二销）'),
+        ('人工成本', 'D', '策划部、销售部、运营部、综合部、总经办、售后服务、AI与数据中心 7 个部门工资，按订单数分摊（计入直接成本）'),
+        ('房租、水电、办公费等', 'I', '固定运营成本分摊'),
+        ('税费及手续费', 'I', '平台手续费、税费'),
+        ('样片研发', 'I', '样片拍摄与研发投入'),
+        ('场地铺设费', 'I', '场地建设与铺设投入'),
+        ('舆情处理', 'I', '口碑维护与客诉处理'),
     ]
+    _CAT_STYLE = {
+        'D': ("直接成本", "background:#fdecea;color:#c0392b;border:1px solid #f5c6c0"),
+        'I': ("间接成本", "background:#fef5e7;color:#b9770e;border:1px solid #f7dcae"),
+    }
     _tot_dir = float(vdf['总直接成本'].sum()) if '总直接成本' in vdf.columns else 0.0
     _fee_rows = []
-    for _name, _desc in _FEE:
+    for _name, _cat, _desc in _FEE:
         if _name not in vdf.columns:
             continue
+        # 推广费显示名随口径切换（底层列名固定为「推广费用（实际）」，仅改显示）
+        _disp = ('推广费用（分摊）' if mode_label == '分摊口径' else '推广费用（实际）') \
+            if _name == '推广费用（实际）' else _name
         _val = float(vdf[_name].sum())
         if _val <= 0:
             continue
         _pct = (_val / _tot_dir * 100) if _tot_dir else 0.0
         _w = min(100.0, _pct * 1.6)
+        _cat_txt, _cat_css = _CAT_STYLE[_cat]
         _fee_rows.append(
             "<tr>"
-            f"<td class='l'>{_name}</td>"
+            f"<td class='l'>{_disp}</td>"
+            f"<td style='width:86px'><span style='display:inline-block;white-space:nowrap;"
+            f"padding:1px 8px;border-radius:9px;font-size:12px;{_cat_css}'>{_cat_txt}</span></td>"
             f"<td style='width:150px'>{_ph_fmt(_val)}</td>"
             "<td style='width:190px'>"
             f"<span class='ph-bar' style='width:{_w:.1f}px'></span>{_pct:.2f}%</td>"
@@ -1016,6 +1031,7 @@ def view_profit_history_page():
             "<div class='ph-tb'><table>"
             "<thead><tr>"
             "<th class='l'>费用项</th>"
+            "<th style='width:86px'>类别</th>"
             "<th style='width:150px'>金额</th>"
             "<th style='width:190px'>占直接成本</th>"
             "<th class='l' style='width:300px'>说明</th>"
@@ -1313,15 +1329,21 @@ def view_profit_history_page():
         # —— 费用结构行 ——
         _fee_rows = []
         _fee_total = 0.0
-        for _n, _d in _FEE:
+        for _n, _cat, _d in _FEE:
             if _n not in src.columns:
                 continue
+            # 推广费显示名随口径切换（底层列名固定，仅改显示）
+            _disp = ('推广费用（分摊）' if '分摊' in str(ml) else '推广费用（实际）') \
+                if _n == '推广费用（实际）' else _n
             _v = float(src[_n].sum())
             if _v <= 0:
                 continue
             _fee_total += _v
+            _cat_txt, _cat_css = _CAT_STYLE[_cat]
             _fee_rows.append(
-                f"<tr><td class='l'>{_n}</td>"
+                f"<tr><td class='l'>{_disp}</td>"
+                f"<td><span style='display:inline-block;white-space:nowrap;padding:1px 8px;"
+                f"border-radius:9px;font-size:12px;{_cat_css}'>{_cat_txt}</span></td>"
                 f"<td>{_exp_wan(_v)}</td>"
                 f"<td>{(_v / _inc * 100) if _inc else 0:.2f}%</td></tr>")
 
@@ -1401,11 +1423,12 @@ tfoot td.l{{text-align:left}}
   </table></div>
   <div class="sec">费用结构</div>
   <div class="tb"><table>
-    <thead><tr><th class="l">费用项</th><th>金额</th><th>占收入</th></tr></thead>
-    <tbody>{''.join(_fee_rows) or '<tr><td colspan="3" style="text-align:center;color:#95a5b6">无费用数据</td></tr>'}</tbody>
-    <tfoot><tr><td class="l">费用合计</td><td>{_exp_wan(_fee_total)}</td>
+    <thead><tr><th class="l">费用项</th><th>类别</th><th>金额</th><th>占收入</th></tr></thead>
+    <tbody>{''.join(_fee_rows) or '<tr><td colspan="4" style="text-align:center;color:#95a5b6">无费用数据</td></tr>'}</tbody>
+    <tfoot><tr><td class="l">费用合计</td><td>—</td><td>{_exp_wan(_fee_total)}</td>
       <td>{(_fee_total / _inc * 100) if _inc else 0:.2f}%</td></tr></tfoot>
-  </table></div>
+  </table>
+  <div class="ft" style="border:0;padding:6px 2px 0">直接成本＝拍摄、推广、交付(主持/场地/搭建)、鲜花、微电影拍摄与剪辑、二销选片、像素蛋糕、后期修片(一销/二销)、工厂(一销/二销)、人工成本(7部门工资)；间接成本＝房租水电办公、税费及手续费、样片研发、场地铺设、舆情处理。</div></div>
   <div class="sec">成本与利润结构</div>
   <div class="tb"><table>
     <thead><tr><th class="l">项目</th><th>金额</th><th>占收入</th></tr></thead>
