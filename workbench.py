@@ -166,7 +166,6 @@ def _wb_query_month(period: str) -> dict:
             'prev_income': income(prev_start, prev_end),
             'cur_direct': direct(start, end),
             'hotel_orders': hotel_orders,
-            'hotel_cover': (hotel_orders / cur_cnt * 100) if cur_cnt else 0,
             'hotel_total': hotel_total,
             'hotel_hotel': hotel_hotel,
             'hotel_minsu': hotel_minsu,

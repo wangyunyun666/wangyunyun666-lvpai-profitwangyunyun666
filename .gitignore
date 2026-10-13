@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# 运行时产物
+*.db-shm
+*.db-wal
+.profile
+
+# 本地密钥（勿提交）
+.streamlit/secrets.toml
+.env
+profit_system.db
+推送到GitHub.md
+# 含明文口令/连接串的项目笔记，严禁提交（2026-10-13 加固）
+项目记忆.md
+项目记忆*.md
+*记忆*.md

@@ -49,7 +49,7 @@ SET_TYPE_MAP = {
     "丽江小发哥专属12520": "旅拍", "丽江小发哥专属16980": "旅拍", "大理小发哥专属16980": "旅拍",
     "新疆特惠8980": "旅拍", "新疆网红款10980": "旅拍", "新疆高定款12980": "旅拍",
     "13980丽江婚礼": "婚礼", "16980丽江目的地婚礼": "婚礼", "16980丽江婚礼": "婚礼",
-    "13980丽江婚礼套系": "婚礼", "14980丽江婚礼套系": "婚礼", "19980丽江婚礼": "婚礼", "16980大理婚礼": "婚礼",
+    "13980丽江婚礼套系": "婚礼", "14980丽江婚礼套系": "婚礼", "14980丽江婚礼": "婚礼", "19980丽江婚礼": "婚礼", "16980大理婚礼": "婚礼",
     "19980大理婚礼": "婚礼", "19980丽江目的地婚礼": "婚礼", "16980丽江目的地": "婚礼",
     "29980丽江目的地婚礼": "婚礼", "20980新疆婚礼": "婚礼", "14980大理婚礼": "婚礼",
     "16980新疆婚礼": "婚礼", "9999纯拍婚礼丽江": "婚礼",
@@ -59,19 +59,23 @@ if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'user_id' not in st.session_state: st.session_state.user_id = None
 if 'username' not in st.session_state: st.session_state.username = None
 if 'role' not in st.session_state: st.session_state.role = None
+# _login_ts 语义＝「最近一次活动时间」（闲置超时用）。必须显式初始化：
+# 旧代码未初始化它，任何"logged_in=True 但 _login_ts 缺失"的路径都会让
+# 超时判定退化成 time.time()-0（天文数字）→ 立即登出并清 cookie（刷新掉登录根因之一）。
+if '_login_ts' not in st.session_state: st.session_state._login_ts = time.time()
 
 # 会话超时（加固）：从环境变量读取，默认 480 分钟，转换为秒
 SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT_MIN", "480")) * 60
 
 # ============================================================================
-# 持久化登录（新增，2026-09）
+# 持久化登录（新增，2026-09；2026-10 修订为「闲置超时」）
 # ----------------------------------------------------------------------------
 # 解决"过一会不用就被踢回登录页"：session_state 只活在 WebSocket 连接期间，
 # 连接一断就丢；改为把签名令牌存进浏览器 cookie，重连时自动恢复登录态。
 # 令牌签名与有效期逻辑全部在 auth_persist.py，此处只做接入。
 # ============================================================================
 _auth.try_restore_login()          # 必须先于任何页面渲染
-_auth.check_session_timeout()      # 应用内超时（默认 480 分钟）及时长判断
+_auth.check_session_timeout()      # 闲置超时：闲置>480min 才登出，活跃则刷新计时
 _auth.flush_pending_cookie()       # 登录/退出后的 cookie 落盘
 
 def add_log(user_id, username, action, details=""):
@@ -79,7 +83,7 @@ def add_log(user_id, username, action, details=""):
     try:
         log = OperationLog(user_id=user_id, username=username, action=action, details=details)
         db.add(log); db.commit()
-    except: pass
+    except Exception: pass
     finally: db.close()
 
 def standardize_period(raw):
@@ -97,18 +101,20 @@ def login_page():
     password = st.text_input("密码", type="password")
     if st.button("登 录"):
         db = SessionLocal()
-        user = db.query(User).filter_by(username=username).first()
-        if user and check_password_hash(user.password_hash, password):
-            st.session_state.logged_in = True
-            st.session_state._login_ts = time.time()
-            st.session_state.user_id = user.id
-            st.session_state.username = user.username
-            st.session_state.role = user.role
-            _auth.save_login(user.username, user.role, user.id)  # 写入持久化 cookie
-            add_log(user.id, user.username, "登录", "登录成功")
-            st.success("登录成功！"); st.rerun()
-        else: st.error("用户名或密码错误")
-        db.close()
+        try:
+            user = db.query(User).filter_by(username=username).first()
+            if user and check_password_hash(user.password_hash, password):
+                st.session_state.logged_in = True
+                st.session_state._login_ts = time.time()
+                st.session_state.user_id = user.id
+                st.session_state.username = user.username
+                st.session_state.role = user.role
+                _auth.save_login(user.username, user.role, user.id)  # 写入持久化 cookie
+                add_log(user.id, user.username, "登录", "登录成功")
+                st.success("登录成功！"); st.rerun()
+            else: st.error("用户名或密码错误")
+        finally:
+            db.close()
     st.caption("默认管理员：admin")
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -127,11 +133,6 @@ def has_permission(module_name, role):
     perm_map = get_permission_map()
     allowed = perm_map.get(module_name, ['admin'])
     return role in allowed
-
-def mask_numeric(value):
-    if isinstance(value, (int, float)):
-        return '***'
-    return value
 
 def mask_dataframe(df):
     if df.empty:
@@ -163,6 +164,9 @@ _WB_MENU = [
     "📜 操作日志",
 ]
 
+# ---- 仅管理员可见的菜单项（用于按角色过滤侧边栏；业务页一律不受影响）----
+_ADMIN_ONLY_MENU = ("🔐 权限管理", "👥 用户管理")
+
 # ---- 已收进导入中心的入口（保留变量以便将来恢复/排查，不在菜单中显示）----
 _WB_MENU_HIDDEN = [
     "📥 导入收入数据",
@@ -179,28 +183,65 @@ _WB_MENU_HIDDEN = [
 ]
 
 
+def _menu_for_role(role):
+    """按角色过滤侧边栏菜单。仅隐藏管理类页面；业务页面保持所有人可见（原行为不变）。"""
+    if role == 'admin':
+        return list(_WB_MENU)
+    return [m for m in _WB_MENU if m not in _ADMIN_ONLY_MENU]
+
+
 def main_sidebar():
     with st.sidebar:
         st.title(f"👤 {st.session_state.username}")
         st.caption(f"角色：{'🔑 管理员' if st.session_state.role == 'admin' else '✏️ 编辑者'}")
         st.divider()
+        # ---- 刷新后停留原页面：从 URL query param 恢复上次页面（新增）----
+        # 必须在 st.radio 创建之前，直接设置 widget 的 key（"nav_menu"）。
+        # restore_page 只接受 _WB_MENU 内的合法值，天然完成「非法/越权回退」。
+        # 仅当 session_state 里还没有本次会话的选择时才恢复，避免覆盖用户刚点的菜单。
+        _menu = _menu_for_role(st.session_state.role)
+        if "nav_menu" not in st.session_state:
+            _saved_page = _auth.restore_page(_menu)
+            if _saved_page:
+                st.session_state["nav_menu"] = _saved_page
         # ---- 工作台跳转通道（必须在 radio 之前）----
         _wb_handle_goto(_WB_MENU)
-        menu = st.radio("导航菜单", _WB_MENU, key="nav_menu")
+        # 兜底：若 session_state 里的导航项不属于当前角色菜单（如管理员退出后同会话以
+        # editor 登录、nav_menu 残留管理页值），回退到菜单首项，避免 st.radio 因值不在
+        # 选项中而报错（线上 Streamlit 版本行为不一致，最坏会整站白屏）。
+        if st.session_state.get("nav_menu") not in _menu:
+            st.session_state["nav_menu"] = _menu[0]
+        menu = st.radio("导航菜单", _menu, key="nav_menu")
+        # 把最终选中的页面写回 URL，供刷新后恢复（值不变时内部不写，避免多余 rerun）
+        _auth.save_current_page(menu)
         st.divider()
         if st.button("🚪 退出登录"):
             add_log(st.session_state.user_id, st.session_state.username, "退出", "退出登录")
-            # 清除持久化 cookie。⚠️ 必须先落盘再 rerun：clear_login 靠渲染
-            # 隐藏 iframe 执行 JS，若之后立刻 rerun，这次渲染会被丢弃，cookie 清不掉。
-            _auth.clear_login()
+            # 清除持久化 cookie。
+            # ⚠️ 关键：用 defer=True —— 不在此处渲染 iframe，而是登记"待清除"，
+            # 由下一轮脚本顶部的 flush_pending_cookie() 落盘。原因：本按钮分支
+            # 紧接着会 st.rerun()，本轮渲染的 iframe 会被丢弃，cookie 清不掉，
+            # 下一轮 try_restore_login() 又会用旧 cookie 把用户自动登回来
+            # （表现为"点退出没反应/退不掉"）。
+            # 同时 clear_login 会置 `_auth_logged_out` 抑制标记，保证在 cookie
+            # 真正消失前，恢复逻辑不会复活登录态。
+            _auth.clear_login(defer=True)
             st.session_state.logged_in = False
             st.session_state._login_ts = 0
+            # 退出时把页面参数重置为首页，避免下次打开时 URL 还停在内页
+            try:
+                _auth.save_current_page("🏠 工作台")
+            except Exception:
+                pass
             # 给浏览器一点时间执行清理脚本；随后由下面的 rerun 回到登录页
             time.sleep(0.6)
             st.rerun()
         return menu
 
 def permission_management_page():
+    if st.session_state.role != 'admin':
+        st.error("无权限：该页面仅管理员可访问。")
+        st.stop()
     st.header("🔐 模块权限管理")
     st.markdown("设置每个功能模块允许查看真实数据的角色（未配置的模块默认仅管理员可看）。")
     all_modules = [
@@ -2170,6 +2211,7 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
 
                     def build_detail_rows(records, order_count):
                         detail_sums = {}
+                        parse_fail = 0
                         for rec in records:
                             if rec.remark and '||解析:' in rec.remark:
                                 parts = rec.remark.split('||解析:')
@@ -2181,9 +2223,11 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                             try:
                                                 val = float(val_str)
                                                 detail_sums[key] = detail_sums.get(key, 0) + val
-                                            except: pass
+                                            except: parse_fail += 1
                             else:
                                 detail_sums['其他'] = detail_sums.get('其他', 0) + rec.amount
+                        if parse_fail > 0:
+                            st.warning(f"有 {parse_fail} 条拍摄费用明细解析失败已跳过，请核对数据。")
                         total = sum(rec.amount for rec in records)
                         parsed_total = sum(detail_sums.values())
                         if parsed_total != total:
@@ -2901,8 +2945,8 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
     )
 
     add_log(st.session_state.user_id, st.session_state.username, "生成利润表", f"月份:{period_month}")
-    period_mode_str = "按月" if month is not None else "按月"
-    filter_label = filter_option if filter_option != "全部" else "全部"
+    period_mode_str = "按月"
+    filter_label = filter_option
     # 快照期间标签：period_month 已经是正确的展示标签
     #   - 单月模式：'2026-08'
     #   - 多月模式：'2026年1月-2026年8月'
@@ -3147,6 +3191,11 @@ def import_income_page():
                 st.success(msg)
                 add_log(st.session_state.user_id, st.session_state.username, "导入收入数据",
                         f"新{import_count}条, 更新{update_count}条" if can_see else "导入收入数据")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入出错：{e}")
@@ -3163,14 +3212,16 @@ def maintain_std_cost_page():
         **常见费用项：** `工厂费用`, `微电影剪辑费`, `修片单价`, `拍摄费用` 等
         """)
     db = SessionLocal()
-    costs = db.query(SetStandardCost).all()
-    if costs:
-        df_costs = pd.DataFrame([{'套系':c.set_name,'费用项':c.cost_item,'金额':c.amount} for c in costs])
-        if can_see:
-            st.write("当前数据：", df_costs)
-        else:
-            st.write("当前数据：", mask_dataframe(df_costs))
-    db.close()
+    try:
+        costs = db.query(SetStandardCost).all()
+        if costs:
+            df_costs = pd.DataFrame([{'套系':c.set_name,'费用项':c.cost_item,'金额':c.amount} for c in costs])
+            if can_see:
+                st.write("当前数据：", df_costs)
+            else:
+                st.write("当前数据：", mask_dataframe(df_costs))
+    finally:
+        db.close()
     uploaded = st.file_uploader("上传标准成本Excel", type="xlsx")
     if uploaded:
         df = pd.read_excel(uploaded)
@@ -3178,7 +3229,7 @@ def maintain_std_cost_page():
             st.write(df.head())
         else:
             st.write(mask_dataframe(df.head()))
-        if st.button("替换全部标准成本"):
+        if st.button("替换全部标准成本", disabled=(st.session_state.role != 'admin')):
             db = SessionLocal()
             try:
                 db.query(SetStandardCost).delete()
@@ -3188,11 +3239,17 @@ def maintain_std_cost_page():
                 msg = f"标准成本已更新" if can_see else "标准成本已更新（数量已隐藏）"
                 st.success(msg)
                 add_log(st.session_state.user_id, st.session_state.username, "维护标准成本", f"更新{len(df)}条" if can_see else "更新***条")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"错误：{e}")
             finally:
                 db.close()
+        st.caption("⚠️ 仅管理员可执行")
 
 def import_operation_cost_page():
     st.markdown("### 📊 导入运营成本")
@@ -3250,6 +3307,11 @@ def import_operation_cost_page():
                 msg = f"成功导入 {len(records)} 条运营成本记录" if can_see else "成功导入 *** 条"
                 st.success(msg)
                 add_log(st.session_state.user_id, st.session_state.username, "导入运营成本", f"共{len(records)}条" if can_see else "导入运营成本")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -3329,6 +3391,7 @@ def import_actual_cost_page():
             "像素蛋糕费用": "像素蛋糕修图费", "像素蛋糕": "像素蛋糕修图费",
             "门店二销款": "二销选片费", "门店二销款结算费": "二销选片费",
         }
+        parse_fail_count = 0
         if is_wide:
             retouch_cols = [c for c in df.columns if "修片费" in c and "微电影" not in c]
             col_mapping = {}
@@ -3353,7 +3416,7 @@ def import_actual_cost_page():
                                     st.warning(f"订单 {oid} 的「拍摄费用」已跳过，请使用「📸 拍摄账单导入」处理。")
                                     continue
                                 records.append((oid, std_name, amount))
-                        except ValueError: pass
+                        except ValueError: parse_fail_count += 1
         else:
             if "订单号" not in df.columns or "费用项" not in df.columns or "金额" not in df.columns:
                 st.error("需要订单号、费用项、金额三列")
@@ -3363,13 +3426,15 @@ def import_actual_cost_page():
                 raw_item = str(row['费用项']).strip()
                 std_item = NAME_MAP.get(raw_item, raw_item)
                 try: amt = float(row['金额'])
-                except: continue
+                except: parse_fail_count += 1; continue
                 if amt != 0:
                     if std_item == '拍摄费用':
                         st.warning(f"订单 {oid} 的「拍摄费用」已跳过，请使用「📸 拍摄账单导入」处理。")
                         continue
                     records.append((oid, std_item, amt))
 
+        if parse_fail_count > 0:
+            st.warning(f"有 {parse_fail_count} 条实际成本金额解析失败已跳过，请核对数据。")
         if not records and not retouch_updates:
             st.warning("没有有效数据")
             return
@@ -3394,6 +3459,11 @@ def import_actual_cost_page():
             msg = f"成功导入/更新 {len(records)} 条成本记录，修片费更新 {len(retouch_updates)} 个订单" if can_see else "成功导入/更新 *** 条成本记录，修片费更新 *** 个订单"
             st.success(msg)
             add_log(st.session_state.user_id, st.session_state.username, "导入实际成本", f"成本{len(records)}条" if can_see else "成本***条")
+            try:
+                from profit_engine import clear_profit_cache
+                clear_profit_cache()
+            except Exception:
+                pass
         except Exception as e:
             db.rollback()
             st.error(f"导入失败：{e}")
@@ -3483,7 +3553,9 @@ def indirect_cost_page():
             else:
                 key = (r.cost_item, r.business_type)
                 saved[key] = r.amount
-    except: pass
+    except:
+        st.error("读取该月已存费用失败，为避免误覆盖已中止。请刷新重试；若持续失败请联系管理员。")
+        st.stop()
     finally: db.close()
 
     if not can_see:
@@ -3594,11 +3666,13 @@ def indirect_cost_page():
     st.subheader("📢 推广费（总额，系统按加权订单数自动拆分）")
     promo_total = st.number_input("推广费总额", min_value=0.0, value=float(saved.get('travel_promo',0)+saved.get('wedding_promo',0)), step=100.0, key="promo_total", disabled=not can_see)
     db = SessionLocal()
-    ratio_rule = db.query(AllocationRule).filter_by(rule_type='promotion_wedding_ratio').first()
-    wedding_ratio = float(ratio_rule.param1) if ratio_rule else 1.0
-    stats_travel = db.query(MonthlyStats).filter_by(period=period, business_type='旅拍').first()
-    stats_wedding = db.query(MonthlyStats).filter_by(period=period, business_type='婚礼').first()
-    db.close()
+    try:
+        ratio_rule = db.query(AllocationRule).filter_by(rule_type='promotion_wedding_ratio').first()
+        wedding_ratio = float(ratio_rule.param1) if ratio_rule else 1.0
+        stats_travel = db.query(MonthlyStats).filter_by(period=period, business_type='旅拍').first()
+        stats_wedding = db.query(MonthlyStats).filter_by(period=period, business_type='婚礼').first()
+    finally:
+        db.close()
     if stats_travel and stats_wedding:
         t_orders = stats_travel.order_count
         w_orders = stats_wedding.order_count
@@ -3614,8 +3688,10 @@ def indirect_cost_page():
     else:
         st.warning("请先在「📊 录入月度基础数据」中录入本月的订单数，以便自动拆分推广费。")
     db = SessionLocal()
-    existing = db.query(IndirectCost).filter_by(period=period).all()
-    db.close()
+    try:
+        existing = db.query(IndirectCost).filter_by(period=period).all()
+    finally:
+        db.close()
     if existing:
         st.subheader("📋 本月已保存的间接费用记录")
         df_exist = pd.DataFrame([{'费用项': e.cost_item, '业务类型': e.business_type or '推广费', '金额': e.amount} for e in existing])
@@ -3645,6 +3721,11 @@ def indirect_cost_page():
                         db.add(IndirectCost(period=period, cost_item='推广费', business_type='旅拍', amount=travel_promo))
                         db.add(IndirectCost(period=period, cost_item='推广费', business_type='婚礼', amount=wedding_promo))
                 db.commit()
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
                 st.success("保存成功！"); st.rerun()
                 add_log(st.session_state.user_id, st.session_state.username, "录入间接成本", f"期间{period}")
             except Exception as e:
@@ -3663,6 +3744,11 @@ def indirect_cost_page():
                         db.add(IndirectCost(period=period, cost_item='推广费', business_type='旅拍', amount=travel_promo))
                         db.add(IndirectCost(period=period, cost_item='推广费', business_type='婚礼', amount=wedding_promo))
                 db.commit()
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
                 st.success("推广费已重新拆分"); st.rerun()
             except Exception as e:
                 db.rollback(); st.error(f"更新失败：{e}")
@@ -3725,6 +3811,11 @@ def monthly_stats_page():
                             db.add(MonthlyStats(period=p, business_type=bt, gross_leads=gross, order_count=orders))
                         db.commit()
                         msg = "毛客资/订单数导入成功！" if can_see else "毛客资/订单数导入成功（数量已隐藏）"
+                        try:
+                            from profit_engine import clear_profit_cache
+                            clear_profit_cache()
+                        except Exception:
+                            pass
                         st.success(msg)
                         st.rerun()
                     except Exception as e:
@@ -3811,8 +3902,10 @@ def monthly_stats_page():
         xj_orders = st.number_input("新疆订单数", min_value=0, value=0, step=1, key="xo", disabled=not can_see)
 
     db = SessionLocal()
-    saved_stats = db.query(MonthlyStats).filter_by(period=period).all()
-    db.close()
+    try:
+        saved_stats = db.query(MonthlyStats).filter_by(period=period).all()
+    finally:
+        db.close()
     if saved_stats:
         for s in saved_stats:
             if s.business_type == '旅拍':
@@ -3836,6 +3929,11 @@ def monthly_stats_page():
             db.add(MonthlyStats(period=period, business_type='婚礼', gross_leads=wedding_gross, order_count=wedding_orders))
             db.add(MonthlyStats(period=period, business_type='新疆', gross_leads=xj_gross, order_count=xj_orders))
             db.commit()
+            try:
+                from profit_engine import clear_profit_cache
+                clear_profit_cache()
+            except Exception:
+                pass
             st.success("月度数据已保存"); st.rerun()
             add_log(st.session_state.user_id, st.session_state.username, "录入月度基础数据", f"期间{period}")
         except Exception as e:
@@ -3868,12 +3966,14 @@ def order_query_page():
     module_name = "🔍 选片订单查询"
     can_see = has_permission(module_name, st.session_state.role)
     db = SessionLocal()
-    total = db.query(func.count(Order.order_id)).scalar()
-    if can_see:
-        st.info(f"数据库共 **{total}** 条选片订单，请使用筛选条件查询（建议选择日期范围）")
-    else:
-        st.info("数据库共 *** 条选片订单，请使用筛选条件查询")
-    db.close()
+    try:
+        total = db.query(func.count(Order.order_id)).scalar()
+        if can_see:
+            st.info(f"数据库共 **{total}** 条选片订单，请使用筛选条件查询（建议选择日期范围）")
+        else:
+            st.info("数据库共 *** 条选片订单，请使用筛选条件查询")
+    finally:
+        db.close()
 
     # ===== 新增：快速修正选片日期（放在最前面，方便直接使用） =====
     st.subheader("📅 快速修正选片日期")
@@ -4426,6 +4526,11 @@ def shooting_bill_import_page():
                 msg = f"成功导入 {len(records)} 条记录" if can_see else "成功导入 *** 条记录"
                 st.success(msg)
                 add_log(st.session_state.user_id, st.session_state.username, "导入拍摄账单", f"导入{len(records)}条" if can_see else "导入***条")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
                 # ===== 覆盖率检查 =====
                 imported_oids = [r[0] for r in records]
                 render_shoot_coverage_check(imported_oids)
@@ -4548,6 +4653,11 @@ def delivery_cost_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条费用" if can_see else "成功导入 *** 条费用")
                 add_log(st.session_state.user_id, st.session_state.username, "导入交付费用", f"共{len(records)}条" if can_see else "共***条")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -4642,6 +4752,11 @@ def venue_self_rent_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条场地费用" if can_see else "成功导入 *** 条场地费用")
                 add_log(st.session_state.user_id, st.session_state.username, "导入自租场地消耗", f"共{len(records)}条" if can_see else "共***条")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -4745,6 +4860,11 @@ def micro_film_shooting_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条微电影拍摄费用" if can_see else "成功导入 *** 条")
                 add_log(st.session_state.user_id, st.session_state.username, "导入微电影拍摄账单", f"共{len(records)}条" if can_see else "共***条")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -4836,6 +4956,11 @@ def micro_film_editing_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条微电影剪辑费用" if can_see else "成功导入 *** 条")
                 add_log(st.session_state.user_id, st.session_state.username, "导入微电影剪辑账单", f"共{len(records)}条" if can_see else "共***条")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -4921,6 +5046,11 @@ def second_sales_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条二销选片费" if can_see else "成功导入 *** 条")
                 add_log(st.session_state.user_id, st.session_state.username, "导入二销选片账单", f"共{len(records)}条" if can_see else "共***条")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -5000,6 +5130,11 @@ def retouch_bill_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条修片费" if can_see else "成功导入 *** 条")
                 add_log(st.session_state.user_id, st.session_state.username, "导入修片账单", f"共{len(records)}条" if can_see else "共***条")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -5096,6 +5231,11 @@ def factory_bill_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条工厂费用" if can_see else "成功导入 *** 条")
                 add_log(st.session_state.user_id, st.session_state.username, "导入工厂账单", f"共{len(records)}条" if can_see else "共***条")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -5149,6 +5289,11 @@ def xinjiang_expense_import_page():
                 msg = f"成功导入 {len(df)} 条新疆费用" if can_see else "成功导入 *** 条新疆费用"
                 st.success(msg)
                 add_log(st.session_state.user_id, st.session_state.username, "导入新疆费用", f"共{len(df)}条" if can_see else "共***条")
+                try:
+                    from profit_engine import clear_profit_cache
+                    clear_profit_cache()
+                except Exception:
+                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -6131,7 +6276,7 @@ def fix_historical_shooting_cost_page():
     这样在账单查询和利润分析时就能正确显示“摄化费用”明细。
     > ⚠️ 操作不可撤销，建议先备份数据库。
     """)
-    if st.button("开始修复历史数据", type="primary"):
+    if st.button("开始修复历史数据", type="primary", disabled=(st.session_state.role != 'admin')):
         db = SessionLocal()
         try:
             records = db.query(ActualDirectCost).filter(
@@ -6154,6 +6299,7 @@ def fix_historical_shooting_cost_page():
             st.error(f"修复失败：{e}")
         finally:
             db.close()
+    st.caption("⚠️ 仅管理员可执行")
 
 def clean_duplicates_page():
     st.header("🧹 一键清理重复数据")
@@ -6169,7 +6315,7 @@ def clean_duplicates_page():
 
     > ⚠️ 去重操作不可逆，请确认后执行。
     """)
-    if st.button("开始清理全部重复数据", type="primary"):
+    if st.button("开始清理全部重复数据", type="primary", disabled=(st.session_state.role != 'admin')):
         db = SessionLocal()
         try:
             # 1. 交付费用去重（含日期）
@@ -6247,11 +6393,17 @@ def clean_duplicates_page():
             msg = f"清理完成！交付费用：{del1_delivery} 条，其他实际成本：{del2_other} 条，月度基础数据：{del3} 条，间接费用：{del4} 条" if can_see else "清理完成！（数量已隐藏）"
             st.success(msg)
             add_log(st.session_state.user_id, st.session_state.username, "清理重复数据", f"成本{total_del}，基础{del3}，间接{del4}" if can_see else "清理完成")
+            try:
+                from profit_engine import clear_profit_cache
+                clear_profit_cache()
+            except Exception:
+                pass
         except Exception as e:
             db.rollback()
             st.error(f"清理失败：{e}")
         finally:
             db.close()
+    st.caption("⚠️ 仅管理员可执行")
 
 def rule_explanation_page():
     st.header("📖 利润计算规则说明")
@@ -6335,64 +6487,72 @@ def rule_explanation_page():
     """)
 
 def user_management_page():
+    if st.session_state.role != 'admin':
+        st.error("无权限：该页面仅管理员可访问。")
+        st.stop()
     st.header("👥 用户管理")
     module_name = "👥 用户管理"
     can_see = has_permission(module_name, st.session_state.role)
     db = SessionLocal()
-    with st.expander("➕ 添加用户"):
-        new_user = st.text_input("用户名")
-        new_pwd = st.text_input("密码", type="password")
-        role = st.selectbox("角色", ["editor", "admin"])
-        if st.button("创建"):
-            if new_user and new_pwd:
-                db.add(User(username=new_user, password_hash=generate_password_hash(new_pwd), role=role))
+    try:
+        with st.expander("➕ 添加用户"):
+            new_user = st.text_input("用户名")
+            new_pwd = st.text_input("密码", type="password")
+            role = st.selectbox("角色", ["editor", "admin"])
+            if st.button("创建"):
+                if new_user and new_pwd:
+                    db.add(User(username=new_user, password_hash=generate_password_hash(new_pwd), role=role))
+                    db.commit()
+                    st.success("创建成功")
+                    add_log(st.session_state.user_id, st.session_state.username, "创建用户", new_user)
+                else: st.warning("请填写完整")
+        users = db.query(User).all()
+        if users:
+            df_users = pd.DataFrame([{'ID':u.id,'用户名':u.username,'角色':u.role,'创建时间':u.created_at} for u in users])
+            if can_see:
+                st.dataframe(df_users, width='stretch')
+            else:
+                st.dataframe(mask_dataframe(df_users), width='stretch')
+            user_to_del = st.selectbox("删除用户", [""] + [u.username for u in users if u.username != 'admin'])
+            if user_to_del and st.button("确认删除"):
+                db.query(User).filter_by(username=user_to_del).delete()
                 db.commit()
-                st.success("创建成功")
-                add_log(st.session_state.user_id, st.session_state.username, "创建用户", new_user)
-            else: st.warning("请填写完整")
-    users = db.query(User).all()
-    if users:
-        df_users = pd.DataFrame([{'ID':u.id,'用户名':u.username,'角色':u.role,'创建时间':u.created_at} for u in users])
-        if can_see:
-            st.dataframe(df_users, width='stretch')
-        else:
-            st.dataframe(mask_dataframe(df_users), width='stretch')
-        user_to_del = st.selectbox("删除用户", [""] + [u.username for u in users if u.username != 'admin'])
-        if user_to_del and st.button("确认删除"):
-            db.query(User).filter_by(username=user_to_del).delete()
-            db.commit()
-            st.success("已删除")
-            add_log(st.session_state.user_id, st.session_state.username, "删除用户", user_to_del)
-    db.close()
+                st.success("已删除")
+                add_log(st.session_state.user_id, st.session_state.username, "删除用户", user_to_del)
+    finally:
+        db.close()
 
 def log_view_page():
     st.header("📜 操作日志")
     module_name = "📜 操作日志"
     can_see = has_permission(module_name, st.session_state.role)
     db = SessionLocal()
-    col1, col2 = st.columns(2)
-    with col1: filter_user = st.text_input("筛选用户")
-    with col2: filter_action = st.selectbox("筛选操作", [""] + ["登录","导入收入数据","导入实际成本","生成利润表","维护标准成本","用户管理"])
-    logs = db.query(OperationLog)
-    if filter_user: logs = logs.filter(OperationLog.username.contains(filter_user))
-    if filter_action: logs = logs.filter(OperationLog.action == filter_action)
-    logs = logs.order_by(OperationLog.timestamp.desc()).limit(200).all()
-    if logs:
-        df_logs = pd.DataFrame([{'时间':l.timestamp,'用户':l.username,'操作':l.action,'详情':l.details} for l in logs])
-        if can_see:
-            st.dataframe(df_logs, width='stretch')
-        else:
-            st.dataframe(mask_dataframe(df_logs), width='stretch')
-    else: st.info("无记录")
-    db.close()
+    try:
+        col1, col2 = st.columns(2)
+        with col1: filter_user = st.text_input("筛选用户")
+        with col2: filter_action = st.selectbox("筛选操作", [""] + ["登录","导入收入数据","导入实际成本","生成利润表","维护标准成本","用户管理"])
+        logs = db.query(OperationLog)
+        if filter_user: logs = logs.filter(OperationLog.username.contains(filter_user))
+        if filter_action: logs = logs.filter(OperationLog.action == filter_action)
+        logs = logs.order_by(OperationLog.timestamp.desc()).limit(200).all()
+        if logs:
+            df_logs = pd.DataFrame([{'时间':l.timestamp,'用户':l.username,'操作':l.action,'详情':l.details} for l in logs])
+            if can_see:
+                st.dataframe(df_logs, width='stretch')
+            else:
+                st.dataframe(mask_dataframe(df_logs), width='stretch')
+        else: st.info("无记录")
+    finally:
+        db.close()
 
-# 会话超时强制登出（加固）：登录态存在但超过 SESSION_TIMEOUT 则登出
-# 已并入 _auth.check_session_timeout()（顶部调用），此处保留原逻辑位置说明。
-if st.session_state.get('logged_in') and (time.time() - st.session_state.get('_login_ts', 0)) > SESSION_TIMEOUT:
-    st.session_state.logged_in = False
-    st.session_state._login_ts = 0
-    _auth.clear_login()
-    st.rerun()
+# 会话超时登出已统一在脚本顶部由 _auth.check_session_timeout() 处理（闲置超时语义）。
+# ⚠️ 这里原先有一段重复检查：
+#     if logged_in and (time.time() - st.session_state.get('_login_ts', 0)) > SESSION_TIMEOUT:
+#         ... clear_login(); st.rerun()
+# 它有两个致命问题，是「刷新后掉登录」的直接根因，故删除：
+#   1) `_login_ts` 默认值取 0：一旦该键缺失/为 0（老会话或 session_state 不完整），
+#      time.time()-0 会是天文数字 → 判定超时 → 登出并 clear_login() 把有效 cookie 删掉；
+#   2) 语义是"绝对超时"，与顶部"闲置超时"矛盾，等于每次登录 8 小时后强制下线。
 
 # 主入口
 if not st.session_state.logged_in:

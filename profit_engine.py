@@ -616,3 +616,16 @@ def generate_profit_report_multi_month(*period_months, promo_mode='actual'):
         db.close()
 
     return result
+
+
+def clear_profit_cache() -> None:
+    """清空利润报表缓存。写操作（导入/维护成本等）成功后调用，
+    避免用户在 10 分钟缓存窗口内看到旧数字。任何异常都不得影响调用方。"""
+    try:
+        generate_profit_report.clear()
+    except Exception:
+        pass
+    try:
+        generate_profit_report_multi_month.clear()
+    except Exception:
+        pass

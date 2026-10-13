@@ -43,6 +43,14 @@
 - 密钥从 `AUTH_SECRET` 环境变量读取；未设置时用基于库路径的稳定派生值
   （同一部署下重启不失效，但换部署即失效）
 - 令牌不写入 URL、不写入日志
+
+超时语义（2026-10 修订）
+------------------------
+`_login_ts` 由"**绝对**登录时刻"改为"**最近一次活动时间**"，超时判定改为
+**闲置超时**：只要持续使用就永不掉线，连续闲置超过 `SESSION_TIMEOUT`
+（默认 480 分钟）才要求重登。修复了"时间长就掉线"（见 `check_session_timeout`
+的文档字符串）。同时把 app.py 里那段语义不一致、且会用 `_login_ts` 默认值 0
+误判超时的重复检查去掉。
 """
 from __future__ import annotations
 
@@ -68,12 +76,19 @@ except ValueError:
     COOKIE_DAYS = DEFAULT_DAYS
 COOKIE_MAX_AGE = max(1, COOKIE_DAYS) * 24 * 3600
 
+# 弱密钥告警只打印一次的模块级标记（避免每次令牌读取都刷一行日志）
+_warned_missing_secret = False
+
 
 def _secret() -> str:
     """签名密钥。优先环境变量；否则用库文件路径派生一个稳定值。"""
     s = os.getenv("AUTH_SECRET")
     if s:
         return s
+    global _warned_missing_secret
+    if not _warned_missing_secret:
+        print("[WARN] 未设置 AUTH_SECRET，登录令牌使用派生密钥，建议在生产 Secrets 中显式设置。")
+        _warned_missing_secret = True
     try:
         base = os.path.dirname(os.path.abspath(__file__))
     except NameError:
@@ -172,18 +187,36 @@ def save_login(username: str, role: str, user_id, defer: bool = True) -> str:
 
 
 def flush_pending_cookie() -> bool:
-    """若存在待写入的令牌，则渲染 iframe 落盘。由 app.py 每轮调用。
+    """若存在待写入/待清除的令牌，则渲染 iframe 落盘。由 app.py 每轮调用。
 
+    处理两类待办：
+      1) `_auth_pending`      登录成功待写入的令牌
+      2) `_auth_pending_clear` 退出登录待清除的 cookie
     返回是否执行了写入。
     """
+    did = False
+    # ① 待清除（退出登录走 defer 通道，避开 rerun 丢弃渲染的问题）
+    if st.session_state.pop("_auth_pending_clear", None):
+        did = _write_cookie("", 0) or did
+    # ② 待写入（登录成功）
     tok = st.session_state.pop("_auth_pending", None)
-    if not tok:
-        return False
-    return _write_cookie(tok, COOKIE_MAX_AGE)
+    if tok:
+        did = _write_cookie(tok, COOKIE_MAX_AGE) or did
+    return did
 
 
 def clear_login(defer: bool = False) -> bool:
-    """清除 cookie（退出登录时调用）。"""
+    """清除 cookie（退出登录时调用）。
+
+    除了渲染清 cookie 的隐藏 iframe，还会设置会话内的 `_auth_logged_out`
+    抑制标记 —— 见 `try_restore_login` 的说明：退出当轮紧接着 rerun 时，
+    浏览器可能还没执行完清 cookie 的脚本，若不抑制，下一轮会「用旧 cookie
+    把用户又自动登回来」，表现为「点退出没反应」。
+    """
+    try:
+        st.session_state["_auth_logged_out"] = True
+    except Exception:
+        pass
     if defer:
         st.session_state._auth_pending_clear = True
         return True
@@ -204,8 +237,21 @@ def try_restore_login() -> bool:
     """若 cookie 里有有效令牌且当前未登录，则恢复登录态。返回是否恢复成功。
 
     必须在渲染任何页面**之前**调用。
+
+    抑制逻辑
+    --------
+    若本会话刚执行过「退出登录」（session_state 里存在 `_auth_logged_out`），
+    则**不再**从 cookie 恢复 —— 直到后续某一轮确认浏览器里的 cookie 已消失，
+    才解除抑制（见 `flush_pending_cookie`）。否则会出现"点了退出、马上又被
+    自动登回来"的假退出（cookie 清除是异步 JS，rerun 会跑在它前面）。
     """
     if st.session_state.get("logged_in"):
+        return False
+    if st.session_state.get("_auth_logged_out"):
+        # 已置退出标记：仅当 cookie 确实已不在时解除抑制，避免被旧 cookie 复活
+        if get_cookie_token():
+            return False
+        st.session_state["_auth_logged_out"] = False
         return False
     data = read_token(get_cookie_token())
     if not data:
@@ -219,14 +265,86 @@ def try_restore_login() -> bool:
     return True
 
 
-def check_session_timeout() -> bool:
-    """应用内超时检查。超时则登出并清 cookie。返回是否已登出。"""
+def check_session_timeout(touch: bool = True) -> bool:
+    """应用内**闲置**超时检查（语义：闲置超过 SESSION_TIMEOUT 才登出）。
+
+    与旧实现的区别（这是本次 Bug 的关键修复点）
+    ------------------------------------------
+    旧实现把 `_login_ts` 当成"**绝对**登录时刻"：只要登录后累计超过
+    480 分钟（8 小时），无论用户是否一直在操作都会被打回登录页——
+    这正是用户抱怨的"时间长就掉线"。现在改为"**闲置**超时"：
+    - `_login_ts` 改为"最近一次活动时间"，每次脚本运行（用户交互会触发）
+      都会刷新它，因此只要一直在用就永不过期；
+    - 只有连续闲置超过 SESSION_TIMEOUT 才要求重登。
+
+    安全兜底（防止误判把有效 session 踢掉）
+    ----------------------------------------
+    若 `_login_ts` 缺失/为 0（例如老会话、异常中断导致 session_state 不完整），
+    不再直接判定超时，而是**补当前时间**——否则 `time.time() - 0` 会是一个
+    天文数字，导致刚恢复登录就被立即登出并清 cookie（旧 app.py:6391 正是如此）。
+
+    返回是否已登出。
+    """
     if not st.session_state.get("logged_in"):
         return False
-    ts = st.session_state.get("_login_ts", 0)
+    ts = st.session_state.get("_login_ts", 0) or 0
     if ts and (time.time() - ts) > SESSION_TIMEOUT:
+        # 真·闲置超时：登出并清 cookie
         st.session_state.logged_in = False
         st.session_state._login_ts = 0
         clear_login()
         return True
+    # 未超时：刷新活动时间（闲置计时器归零）。touch=False 用于不希望
+    # 刷新的场景（当前未使用，保留扩展位）。
+    if touch:
+        st.session_state._login_ts = time.time()
     return False
+
+
+# ============================================================================
+# 当前页面持久化（刷新后停留在原页面）
+# ============================================================================
+# 设计说明
+# --------
+# 侧边栏菜单是 `st.radio`，其选中值只存在于 session_state；浏览器刷新
+# 会重建 session_state → radio 回到第一项（默认「🏠 工作台」）。
+# 最轻量的持久化通道是 **URL query param**（`st.query_params`）：
+#   1) 刷新后 query string 会保留，无需 cookie/新依赖；
+#   2) 与登录态解耦，未登录时不读取（避免泄露内页）；
+#   3) 分享/收藏链接还能直达页面，体验更好。
+# 菜单名含 emoji，`st.query_params` 会自动做 percent-encoding，读回时自动解码，
+# 无需手工 urllib.parse。为避免污染正常页面的 URL，仅在值变化时才写入。
+PAGE_QP = "p"
+
+
+def save_current_page(menu: str) -> None:
+    """把当前页面名写进 URL query param（值未变时不写，减少无谓 rerun）。"""
+    if not menu:
+        return
+    try:
+        qp = st.query_params
+        if qp.get(PAGE_QP) != menu:
+            qp[PAGE_QP] = menu
+    except Exception:
+        # query_params 在极少数环境下可能不可用；失败不致命（最坏退化为首页）
+        pass
+
+
+def restore_page(menu_list) -> str | None:
+    """从 query param 读回页面名，校验合法性后返回；非法/缺失返回 None。
+
+    `menu_list` 之外的值一律丢弃 —— 保证即便手改了 URL，也只能落到合法菜单项，
+    不会越权跳到不在该角色菜单里的页面（权限校验在调用方按 role 过滤 menu_list）。
+    """
+    try:
+        raw = st.query_params.get(PAGE_QP)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    # 兼容 query_params 返回 list 的实现（?p=a&p=b）
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else None
+    if not raw:
+        return None
+    return raw if raw in menu_list else None
