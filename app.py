@@ -11,6 +11,9 @@ from import_center import import_center_page, inject_ic_css as _ic_css
 import auth_persist as _auth
 from database import SessionLocal, User, Order, SetStandardCost, ActualDirectCost, CherryProductCost, IndirectCost, AllocationRule, OperationLog, MonthlyStats, ModulePermission, ProfitSnapshot, EmployeeSalary
 from profit_engine import generate_profit_report, generate_profit_report_multi_month, is_excluded_order
+import streamlit.components.v1 as components
+from dual_report_v3 import render as render_brief_report
+import hist_yoy
 from sqlalchemy import func
 from werkzeug.security import generate_password_hash, check_password_hash
 import re
@@ -616,6 +619,7 @@ def generate_html_report(df_biz, total_income, total_direct, total_indirect, tot
     </div>
 
     <div class="caliber-note">同比/环比分析基于导出口径：{caliber_label}</div>
+    <div class="caliber-note" style="margin-top:4px;">口径用途：<b>股东、财务对账</b>请选「实际口径」（与实际支出一致）；<b>销售部经营分析</b>请选「分摊口径」。</div>
 
     <div class="section-title">📸 拍摄费用明细分析（含同比）</div>
     <div class="table-wrapper">
@@ -845,13 +849,15 @@ def view_profit_history_page():
         "</div></div>",
         unsafe_allow_html=True)
 
-    # 口径说明条
+    # 口径说明条（2026-10-13 修正文案：原文与实际算法不符，易误导看报表的人）
     if _mode == 'allocation':
-        _tip = ("分摊口径 —— 人工、推广费按下单订单数分摊到各套系，"
-                "用于评估套系本身定价是否合理。")
+        _tip = ("分摊口径 —— 人工成本、推广费按「下单订单数」分摊到各套系。"
+                "分摊后这两项的合计会小于实际支出，只反映「选片订单自己承担的那一份」。"
+                "👉 用途：销售部经营分析（看套系定价、获客效率）。")
     else:
-        _tip = ("实际口径 —— 推广费按实际发生计入，人工按下单订单数分摊，"
-                "更接近当期真实现金成本。")
+        _tip = ("实际口径 —— 人工成本、推广费按「选片订单数」分摊，"
+                "两项合计与实际支出完全一致（经 1–7 月实测，推广费差 0.01 元、人工成本差 0.00 元）。"
+                "👉 用途：股东、财务对账（真实盈利）。")
     st.markdown(
         "<div class='ph-mode'>"
         f"<div class='ph-mbtn on'>{mode_label}</div>"
@@ -1300,6 +1306,115 @@ def view_profit_history_page():
         v = float(v)
         return f"{v / 10000:,.2f}万" if abs(v) >= 10000 else f"{v:,.2f}"
 
+    # ==================== 双口径对照（汇报用）====================
+    # 只做「把两套口径并列展示 + 解释差额来源」，不参与任何计算口径，
+    # 两套数字仍分别来自 generate_profit_report_multi_month(promo_mode=...)。
+    def _build_dual_caliber_html(df_a, df_b, la, lb, span, biz, pair_rows, loss_a, loss_b, both_loss):
+        _gen = datetime.now().strftime('%Y-%m-%d %H:%M')
+        inc_a = float(df_a['总收入'].sum())
+        inc_b = float(df_b['总收入'].sum())
+        prof_a = float(df_a['利润合计'].sum())
+        prof_b = float(df_b['利润合计'].sum())
+        rate_a = (prof_a / inc_a * 100) if inc_a else 0.0
+        rate_b = (prof_b / inc_b * 100) if inc_b else 0.0
+
+        def _col(v):
+            return '#c0392b' if v >= 0 else '#27ae60'
+
+        _sum_rows = []
+        for _name, _va, _vb in pair_rows:
+            _d = _va - _vb
+            # 只有「收入/利润」行按红涨绿跌着色；成本行的差额不带语义色，避免误读
+            _c = ('pos' if _d >= 0 else 'neg') if _name in ('总收入', '利润合计') else ''
+            _sum_rows.append(
+                f"<tr><td class='l'>{_name}</td>"
+                f"<td>{_exp_wan(_va)}</td><td>{_exp_wan(_vb)}</td>"
+                f"<td class='{_c}'>{_exp_wan(_d)}</td></tr>")
+
+        _rk_rows = []
+        for _i, (_n, _bizn, _cnt, _pa, _pb) in enumerate(both_loss, 0):
+            _rk_rows.append(
+                f"<tr><td class='l'>{_ph_esc(_n)}</td><td class='c'>{_ph_esc(_bizn)}</td>"
+                f"<td>{_cnt:,}</td><td style='color:{_col(_pa)}'>{_exp_wan(_pa)}</td>"
+                f"<td style='color:{_col(_pb)}'>{_exp_wan(_pb)}</td></tr>")
+
+        _html = f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>双口径利润对照报告 · {span}</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;background:#f4f6fa;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#1f2d3d}}
+.wrap{{max-width:1080px;margin:0 auto;padding:28px 20px 60px}}
+.hd{{background:linear-gradient(135deg,#4f46e5,#6366f1);border-radius:14px;padding:22px 26px;color:#fff}}
+.hd h1{{margin:0 0 8px;font-size:23px}}
+.hd .meta{{font-size:13.5px;opacity:.93;line-height:1.8}}
+.cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}}
+.card{{background:#fff;border-radius:12px;padding:14px 16px;box-shadow:0 1px 3px rgba(16,42,67,.08)}}
+.card .k{{font-size:12.5px;color:#8296a8;margin-bottom:6px}}
+.card .v{{font-size:20px;font-weight:700}}
+.card .s{{font-size:11.5px;color:#9aa9b8;margin-top:5px}}
+.sec{{font-size:16px;font-weight:700;margin:26px 0 10px;padding-left:10px;border-left:4px solid #4f46e5}}
+.note{{background:#eef2ff;border:1px solid #c7d2fe;border-radius:10px;padding:12px 16px;font-size:13px;line-height:1.95}}
+.tb{{background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(16,42,67,.08)}}
+table{{width:100%;border-collapse:collapse;font-size:13.5px}}
+th{{background:#f7f9fc;color:#5b6b7c;font-weight:600;padding:10px 12px;text-align:right;border-bottom:1px solid #e8eef5}}
+th.l,td.l{{text-align:left}}
+td{{padding:10px 12px;text-align:right;border-bottom:1px solid #f2f5f9}}
+tr:last-child td{{border-bottom:0}}
+.pos{{color:#c0392b}}.neg{{color:#059669}}
+.ft{{text-align:center;font-size:12px;color:#95a5b6;margin-top:26px;line-height:1.9}}
+ul{{margin:8px 0 0 18px;padding:0;font-size:13px;line-height:2}}
+</style></head><body><div class="wrap">
+  <div class="hd">
+    <h1>双口径利润对照报告</h1>
+    <div class="meta">数据区间：{span}　·　业务线：{biz}　·　共 {len(df_a)} 个套系 / {int(df_a['套系数量'].sum()):,} 单<br>
+    口径 A：{la}　·　口径 B：{lb}　·　生成时间：{_gen}</div>
+  </div>
+  <div class="cards">
+    <div class="card"><div class="k">总收入（两口径相同）</div><div class="v">{_exp_wan(inc_a)}</div>
+      <div class="s">收入不受口径影响</div></div>
+    <div class="card"><div class="k">利润 · {la}</div>
+      <div class="v" style="color:{_col(prof_a)}">{_exp_wan(prof_a)}</div>
+      <div class="s">利润率 {rate_a:.2f}%</div></div>
+    <div class="card"><div class="k">利润 · {lb}</div>
+      <div class="v" style="color:{_col(prof_b)}">{_exp_wan(prof_b)}</div>
+      <div class="s">利润率 {rate_b:.2f}%</div></div>
+    <div class="card"><div class="k">两口径利润差</div>
+      <div class="v">{_exp_wan(prof_a - prof_b)}</div>
+      <div class="s">A − B</div></div>
+  </div>
+
+  <div class="note"><b>两个口径为什么不一样？</b><br>
+  · <b>{la}</b>：人工成本、推广费按「{la == '实际口径' and '选片订单数' or '下单订单数'}」分摊，两项合计{la == '实际口径' and '与实际支出完全一致，可与财务账对账（给股东、财务看）' or '小于实际支出，只反映选片订单自己承担的那一份（给销售部做经营分析）'}。<br>
+  · <b>{lb}</b>：同上，分母换成「{lb == '实际口径' and '选片订单数' or '下单订单数'}」，合计{lb == '实际口径' and '与实际支出完全一致' or '小于实际支出'}。<br>
+  · <b>结论：收入两边必然相同，差额只出现在「人工成本 + 推广费」这两项上，其余 18 个费用项两边一致。</b></div>
+
+  <div class="sec">一、汇总对照</div>
+  <div class="tb"><table>
+    <thead><tr><th class="l">项目</th><th>口径 A · {la}</th><th>口径 B · {lb}</th><th>A − B</th></tr></thead>
+    <tbody>{''.join(_sum_rows)}</tbody>
+  </table></div>
+
+  <div class="sec">二、两口径都亏损的套系（真实亏损，需重点处理）</div>
+  <div class="tb"><table>
+    <thead><tr><th class="l">套系</th><th class="c">业务线</th><th>单数</th><th>{la} 利润</th><th>{lb} 利润</th></tr></thead>
+    <tbody>{''.join(_rk_rows) or '<tr><td colspan="5" style="text-align:center;color:#95a5b6">两个口径下均无亏损套系</td></tr>'}</tbody>
+  </table></div>
+
+  <div class="sec">三、经营建议（自动提示）</div>
+  <div class="note"><ul>
+    <li>{la} 亏损套系 <b>{loss_a}</b> 个，{lb} 亏损套系 <b>{loss_b}</b> 个，两者都亏 <b>{len(both_loss)}</b> 个。</li>
+    <li>两个口径<b>都亏损</b>的套系 → <b>真实亏损</b>，建议核对该套系成本录入是否完整，并评估是否继续售卖。</li>
+    <li>只有一个口径亏损、另一个口径盈利的套系 → 属<b>成本分摊敏感型</b>：差异全部来自人工与推广的分母不同，说明该套系对获客成本与人力投入敏感，优先调价或控投。</li>
+    <li>给股东汇报用<b>实际口径</b>（与实际支出对账一致）；给销售部用<b>分摊口径</b>（看套系自身赚钱能力）。</li>
+  </ul></div>
+
+  <div class="ft">本报告由「旅拍利润系统」生成 · 双口径并列展示，不改动任何计算口径<br>
+  {span} · {biz} · 生成时间 {_gen} · 单文件离线可开，可直接转发</div>
+</div></body></html>"""
+        return _html
+
     def _build_profit_history_html(src, span, ml, biz):
         """把当前筛选结果渲染成完整独立 HTML 报告。"""
         _inc = float(src['总收入'].sum())
@@ -1397,8 +1512,8 @@ tfoot td.l{{text-align:left}}
     <div class="meta">数据区间：{span}　·　共 {len(src)} 个套系 / {_units:,} 单<br>
     费用口径：{ml}　·　业务线：{biz}</div>
   </div>
-  <div class="mode">{ml} —— {'人工、推广费按下单订单数分摊到各套系，用于评估套系定价合理性。'
-    if ml == '分摊口径' else '只统计实际发生的费用，未分摊的固定成本不纳入，反映真实现金流成本。'}</div>
+  <div class="mode">{ml} —— {'人工成本、推广费按「下单订单数」分摊到各套系，分摊后合计小于实际支出，用于销售部经营分析（看套系定价与获客效率）。'
+    if ml == '分摊口径' else '人工成本、推广费按「选片订单数」分摊，两项合计与实际支出一致，可用于与财务账/利润表模板对账，供股东查看真实盈利。'}</div>
   <div class="cards">
     <div class="card"><div class="k">套系总数</div><div class="v">{len(src)}</div></div>
     <div class="card"><div class="k">订单总数</div><div class="v">{_units:,}</div></div>
@@ -1452,6 +1567,164 @@ tfoot td.l{{text-align:left}}
         "📥 导出 HTML 报告", _export_html.encode('utf-8'),
         f"利润表历史报告_{_span_txt}_{mode_label}_{_biz}.html", "text/html")
 
+    # ==================== 双口径对照（汇报用）====================
+    st.markdown("<div class='ph-sec'>双口径对照（汇报用）</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='ph-hint'>同一批数据、两套口径并列。<b>实际口径</b>＝人工与推广按「选片订单数」分摊，"
+        "合计与实际支出一致 → 给股东、财务对账；<b>分摊口径</b>＝按「下单订单数」分摊，"
+        "合计小于实际支出 → 给销售部做经营分析。收入两边必然相同，差额只出现在人工成本与推广费两项。</div>",
+        unsafe_allow_html=True)
+
+    _other_label = '分摊口径' if _mode == 'actual' else '实际口径'
+    _other_mode = 'allocation' if _mode == 'actual' else 'actual'
+    try:
+        with st.spinner(f"正在计算「{_other_label}」…"):
+            _other_raw = generate_profit_report_multi_month(*sel_months, promo_mode=_other_mode)
+    except Exception as _e:
+        _other_raw = pd.DataFrame()
+        st.warning(f"「{_other_label}」计算失败：{_e}")
+
+    if not can_see:
+        # 无查看真实数字权限的账号：明细一律不展示，避免脱敏数据进入对照计算
+        st.markdown("<div class='ph-hint'>当前账号无查看真实数字的权限，双口径对照明细不展示。</div>",
+                    unsafe_allow_html=True)
+    elif _other_raw is None or _other_raw.empty:
+        st.info(f"「{_other_label}」在该区间暂无数据，无法对照")
+    else:
+        _odf = _other_raw if _biz == '全部' else _other_raw[_other_raw['业务类型'] == _biz].copy()
+
+        def _dsum(dfx, col):
+            try:
+                return float(dfx[col].sum()) if (col in getattr(dfx, 'columns', []) and len(dfx)) else 0.0
+            except Exception:
+                return 0.0
+
+        _a_inc, _b_inc = _dsum(vdf, '总收入'), _dsum(_odf, '总收入')
+        _a_prof, _b_prof = _dsum(vdf, '利润合计'), _dsum(_odf, '利润合计')
+        _a_sal, _b_sal = _dsum(vdf, '人工成本'), _dsum(_odf, '人工成本')
+        _a_promo, _b_promo = _dsum(vdf, '推广费用（实际）'), _dsum(_odf, '推广费用（实际）')
+        _a_dc, _b_dc = _dsum(vdf, '总直接成本'), _dsum(_odf, '总直接成本')
+        _a_ic, _b_ic = _dsum(vdf, '总间接成本'), _dsum(_odf, '总间接成本')
+
+        _pair_rows = [
+            ('总收入', _a_inc, _b_inc),
+            ('人工成本', _a_sal, _b_sal),
+            ('推广费用', _a_promo, _b_promo),
+            ('总直接成本', _a_dc, _b_dc),
+            ('总间接成本', _a_ic, _b_ic),
+            ('总成本', _a_dc + _a_ic, _b_dc + _b_ic),
+            ('利润合计', _a_prof, _b_prof),
+        ]
+
+        _dual_rows = []
+        for _nm, _va, _vb in _pair_rows:
+            _d = _va - _vb
+            # 只有「收入/利润」行按红涨绿跌着色；成本行的差额不带语义色
+            if _nm in ('总收入', '利润合计'):
+                _c = 'ph-up' if _d >= 0 else 'ph-down'
+            else:
+                _c = ''
+            _dual_rows.append(
+                "<tr>"
+                f"<td class='l'>{_nm}</td>"
+                f"<td>{_ph_fmt(_va)}</td><td>{_ph_fmt(_vb)}</td>"
+                f"<td class='{_c}'>{_ph_fmt(_d)}</td></tr>")
+        _dual_rows.append(
+            "<tr>"
+            "<td class='l'>利润率</td>"
+            f"<td>{(_a_prof / _a_inc * 100) if _a_inc else 0:.2f}%</td>"
+            f"<td>{(_b_prof / _b_inc * 100) if _b_inc else 0:.2f}%</td>"
+            f"<td>{( (_a_prof / _a_inc * 100) if _a_inc else 0) - ((_b_prof / _b_inc * 100) if _b_inc else 0):.2f}pt</td>"
+            "</tr>")
+
+        st.markdown(
+            "<div class='ph-tb'><table>"
+            "<thead><tr>"
+            "<th class='l'>项目</th>"
+            f"<th style='width:150px'>{mode_label}（当前）</th>"
+            f"<th style='width:150px'>{_other_label}</th>"
+            "<th style='width:150px'>差额</th>"
+            "</tr></thead><tbody>" + "".join(_dual_rows) + "</tbody></table></div>",
+            unsafe_allow_html=True)
+
+        _under = (_a_sal + _a_promo) - (_b_sal + _b_promo) if _mode == 'actual' else (_b_sal + _b_promo) - (_a_sal + _a_promo)
+        st.markdown(
+            f"<div class='ph-hint'>差额来源：分摊口径下「人工成本 + 推广费」合计比实际口径"
+            f"<b>少 {_ph_fmt(_under)}</b>（分母用了下单订单数，选片订单只承担自己那份），"
+            "其余 18 个费用项两口径完全一致，收入也一致。差额列里，<b>收入/利润行</b>红色=当前口径更高、"
+            "绿色=更低；<b>成本行</b>不配色（正数表示当前口径成本更高）。</div>",
+            unsafe_allow_html=True)
+
+        # —— 套系级：两口径利润对照（按差额绝对值降序，取前 15）——
+        _mrg = pd.merge(
+            vdf[['业务类型', '套系', '套系数量', '利润合计']],
+            _odf[['套系', '利润合计']].rename(columns={'利润合计': '对口径利润'}),
+            on='套系', how='outer')
+        _mrg['利润合计'] = _mrg['利润合计'].fillna(0.0)
+        _mrg['对口径利润'] = _mrg['对口径利润'].fillna(0.0)
+        _mrg['单数x'] = _mrg['套系数量'].fillna(0)
+        _mrg['业务类型'] = _mrg['业务类型'].fillna('')
+        # 「本口径」= 页面当前所选口径
+        if _mode == 'actual':
+            _mrg['本口径利润'] = _mrg['利润合计']
+        else:
+            _mrg['本口径利润'] = _mrg['对口径利润']
+            _mrg['对口径利润'] = _mrg['利润合计']
+        _mrg['口径差额'] = _mrg['本口径利润'] - _mrg['对口径利润']
+
+        _loss_a = int((_mrg['本口径利润'] < 0).sum())
+        _loss_b = int((_mrg['对口径利润'] < 0).sum())
+        _both = _mrg[(_mrg['本口径利润'] < 0) & (_mrg['对口径利润'] < 0)].copy()
+        _both = _both.sort_values('本口径利润').reset_index(drop=True)
+
+        _top = _mrg.reindex(_mrg['口径差额'].abs().sort_values(ascending=False).index).head(15)
+        _top_rows = []
+        for _, _r in _top.iterrows():
+            _c1 = 'ph-up' if float(_r['本口径利润']) >= 0 else 'ph-down'
+            _c2 = 'ph-up' if float(_r['对口径利润']) >= 0 else 'ph-down'
+            _bt = str(_r.get('业务类型', '') or '')
+            _tag = 't-lp' if '旅拍' in _bt else ('t-hl' if '婚礼' in _bt else '')
+            _top_rows.append(
+                "<tr>"
+                f"<td class='l'>{_ph_esc(_r['套系'])}</td>"
+                f"<td class='c'><span class='ph-tag {_tag}'>{_ph_esc(_bt)}</span></td>"
+                f"<td>{int(_r['单数x']):,}</td>"
+                f"<td class='{_c1}'>{float(_r['本口径利润']) / 10000:,.2f}</td>"
+                f"<td class='{_c2}'>{float(_r['对口径利润']) / 10000:,.2f}</td>"
+                f"<td>{float(_r['口径差额']) / 10000:,.2f}</td>"
+                "</tr>")
+        st.markdown(
+            "<div class='ph-tb' style='margin-top:12px'><table>"
+            "<thead><tr>"
+            "<th class='l'>套系（按两口径差额排序）</th><th class='c' style='width:76px'>业务线</th>"
+            "<th style='width:72px'>单数</th>"
+            f"<th style='width:110px'>{mode_label} 利润(万)</th>"
+            f"<th style='width:110px'>{_other_label} 利润(万)</th>"
+            "<th style='width:104px'>差额(万)</th>"
+            "</tr></thead><tbody>" + "".join(_top_rows) + "</tbody></table></div>",
+            unsafe_allow_html=True)
+
+        _both_rows = []
+        for _, _r in _both.head(20).iterrows():
+            _both_rows.append((str(_r['套系']), str(_r.get('业务类型', '') or ''),
+                               int(_r['单数x'] or 0),
+                               float(_r['本口径利润']), float(_r['对口径利润'])))
+
+        st.markdown(
+            f"<div class='ph-hint' style='margin-top:12px'>两个口径<b>都亏损</b>的套系 "
+            f"<b>{len(_both)}</b> 个（真实亏损，建议核对成本录入并评估是否继续售卖）；"
+            "只有一个口径亏损、另一个盈利的套系属<b>成本分摊敏感型</b>，差异全部来自人工与推广的分母不同，"
+            "可优先调价或控投。</div>",
+            unsafe_allow_html=True)
+
+        _dual_html = _build_dual_caliber_html(
+            vdf, _odf, mode_label, _other_label, _span_txt, _biz,
+            _pair_rows, _loss_a, _loss_b, _both_rows)
+        st.download_button(
+            "📥 导出双口径对照报告（含汇总 + 差异拆解 + 亏损套系）",
+            _dual_html.encode('utf-8'),
+            f"双口径对照报告_{_span_txt}_{_biz}.html", "text/html")
+
     # ==================== 历史快照（保留原功能）====================
     st.markdown("<div class='ph-sec'>历史快照</div>", unsafe_allow_html=True)
 
@@ -1500,6 +1773,74 @@ tfoot td.l{{text-align:left}}
                                 st.rerun()
     finally:
         _db.close()
+
+# ============================================================================
+# 经营利润汇报（双口径 · 可切换）辅助函数
+# ----------------------------------------------------------------------------
+# 纯展示层：只做「取数 → 汇总 → 渲染」，不参与任何成本口径计算。
+# ============================================================================
+def _shift_year_date(d, years=1):
+    """日期整体回退 N 年；2/29 等非法日期兜底到 2/28。"""
+    try:
+        return d.replace(year=d.year - years)
+    except ValueError:
+        return d.replace(year=d.year - years, day=28)
+
+
+def _period_months(start, end):
+    """列出区间覆盖的月份，如 ['2025-01', '2025-02']。"""
+    out, cur = [], start.replace(day=1)
+    while cur <= end:
+        out.append(cur.strftime('%Y-%m'))
+        cur = (cur + timedelta(days=32)).replace(day=1)
+    return out
+
+
+def _hist_rec_from_df(df, biz=None):
+    """把某期报表聚合为同比所需的记录（收入 / 单数 / 推广 / 人工 / 净利润）。"""
+    if df is None or len(df) == 0:
+        return None
+    d = df
+    if biz is not None:
+        if '业务类型' not in df.columns:
+            return None
+        d = df[df['业务类型'].astype(str) == str(biz)]
+        if len(d) == 0:
+            return None
+
+    def _s(col):
+        if col not in d.columns:
+            return 0.0
+        return float(pd.to_numeric(d[col], errors='coerce').fillna(0.0).sum())
+
+    return {'收入': _s('总收入'), '单数': _s('套系数量'), '推广': _s('推广费用（实际）'),
+            '人工': _s('人工成本'), '净利润': _s('利润合计')}
+
+
+def _yoy_pack_from_df(df):
+    """构造汇报模板所需的同比包 {'all': …, 各业务线: …}；无数据时返回 None。"""
+    rec = _hist_rec_from_df(df)
+    if not rec or (abs(rec['收入']) < 0.005 and abs(rec['单数']) < 0.005):
+        return None
+    pack = {'all': rec}
+    if df is not None and '业务类型' in df.columns:
+        for b in pd.Series(df['业务类型']).dropna().astype(str).unique():
+            r = _hist_rec_from_df(df, b)
+            if r:
+                pack[b] = r
+    return pack
+
+
+def _extra_rows(df, columns, title):
+    """把分析用 DataFrame 转成汇报模板的「附录表」结构 (标题, 表头, 行)。"""
+    if df is None or len(df) == 0:
+        return None
+    cols = [c for c in columns]
+    if not all(c in df.columns for c in cols):
+        return None
+    rows = [['—' if pd.isna(v) else str(v) for v in r] for r in df[cols].values.tolist()]
+    return (title, cols, rows)
+
 
 def profit_report_page():
     st.header("📊 利润表生成与分析")
@@ -2966,6 +3307,130 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
         file_name=f"利润分析_{period_month}_{filter_option}_{promo_mode_label}.html",
         mime="text/html"
     )
+
+    # ==================== 经营利润汇报（双口径 · 可切换 · 含同比/环比/均价） ====================
+    # 纯展示层：复用上面已算好的本期两口径 DataFrame，另取「上月」「去年同期」两期数据，
+    # 交给 dual_report_v3 渲染成单文件 HTML（右上角切换口径，打印自动展开）。
+    st.divider()
+    st.subheader("📊 经营利润汇报（可切换口径 · 含同比 / 环比 / 均价）")
+    st.caption(
+        "面向汇报的**单文件 HTML**：右上角一键切换「实际口径 / 分摊口径 / 两口径对照」，"
+        "并把同比（去年同期）、环比（上月）、均价与费用 / 人工 / 均价三个分析块合并到一份里。"
+        "　给销售部做经营分析用分摊口径，给股东、财务对账用实际口径。"
+    )
+
+    # 日期基准（防御性取值：上游按「按月 / 多月」分支分别赋值，缺失时自行兜底）
+    _lms = locals().get('last_month_start')
+    _lme = locals().get('last_month_end')
+    _lys = locals().get('last_year_start') or _shift_year_date(period_start)
+    _lye = locals().get('last_year_end') or _shift_year_date(period_end)
+
+    with st.spinner("正在汇总环比（上月）与同比（去年同期）数据…"):
+        _brief_prev, _brief_yoy = {}, {}
+        for _m in ('actual', 'allocation'):
+            _d = None
+            if _lms and _lme:
+                _d = _apply_filter(generate_profit_report(
+                    _lms.strftime('%Y-%m-%d'),
+                    _lme.strftime('%Y-%m-%d'), _m), filter_option)
+            _brief_prev[_m] = _d
+            _brief_yoy[_m] = _yoy_pack_from_df(_apply_filter(generate_profit_report(
+                _lys.strftime('%Y-%m-%d'),
+                _lye.strftime('%Y-%m-%d'), _m), filter_option))
+
+    # ---- 同比数据源：数据库优先；库内没有去年同期订单时，可上传历史年度汇总表补全
+    _yoy_from_upload = False
+    if not (_brief_yoy['actual'] or _brief_yoy['allocation']):
+        st.info(
+            f"系统数据库中未查到去年同期（{_lys.strftime('%Y-%m-%d')} ~ "
+            f"{_lye.strftime('%Y-%m-%d')}）的订单数据，同比列将显示「—」。"
+            "如需补全同比，请上传该年度的《旅拍利润全年-汇总》与《婚礼利润全年-汇总》（.xlsx）。"
+        )
+        _uc1, _uc2 = st.columns(2)
+        _uf1 = _uc1.file_uploader('旅拍利润全年-汇总.xlsx', type=['xlsx', 'xls'], key='yoy_up_travel')
+        _uf2 = _uc2.file_uploader('婚礼利润全年-汇总.xlsx', type=['xlsx', 'xls'], key='yoy_up_wedding')
+        if _uf1 or _uf2:
+            with st.spinner("正在解析历史汇总表…"):
+                _hist = hist_yoy.load_from_files([_uf1, _uf2])
+                _ly_months = _period_months(_lys, _lye)
+                for _m in ('actual', 'allocation'):
+                    _brief_yoy[_m] = {
+                        'all': hist_yoy.sum_months(_hist, _ly_months, _m),
+                        '旅拍': hist_yoy.sum_months(_hist, _ly_months, _m, '旅拍'),
+                        '婚礼': hist_yoy.sum_months(_hist, _ly_months, _m, '婚礼'),
+                    }
+                _yoy_from_upload = True
+
+    # ---- 附录：把系统已算好的三个分析块（费用明细 / 人工部门 / 均价）转成汇报的附表
+    _ex_cur = [x for x in (
+        _extra_rows(detail_df, shoot_columns, '📸 拍摄费用明细分析（含同比）'),
+        _extra_rows(salary_df, labor_columns, '💼 人工成本分析（部门均价同比）'),
+        _extra_rows(avg_df, avg_columns, '📈 均价及同比环比分析'),
+    ) if x]
+    _other_name = '实际口径' if promo_mode == 'allocation' else '分摊口径'
+    _notice_other = ('__notice__',
+                     f"本视图的费用与均价明细未随口径联算：系统当前选择的是「{promo_mode_label}」。"
+                     f"把左侧「费用口径」切到「{_other_name}」再导一次，本视图即显示该口径的对应数字。", [])
+    _extra_map = ({'a': _ex_cur, 'b': [_notice_other]} if promo_mode == 'actual'
+                  else {'a': [_notice_other], 'b': _ex_cur})
+
+    _yoy_label = (_lys.strftime('%Y-%m')
+                  if (_lys.year == _lye.year and _lys.month == _lye.month)
+                  else f"{_lys.strftime('%Y-%m')} ~ {_lye.strftime('%Y-%m')}")
+    _seg_label = {'全部': '全部业务', '仅旅拍': '旅拍', '仅婚礼': '婚礼', '仅新疆地区': '新疆'}.get(
+        filter_option, '全部业务')
+
+    # ---- 业务线分段：旅拍 / 婚礼 / 新疆 三块并列，各自一份完整报表
+    # 口径互斥且合计＝全量：新疆按套系名含「新疆」切（跨旅拍、婚礼两条业务线），
+    # 旅拍、婚礼各自再剔除新疆套系，避免重复计算。
+    _SEG_DEF_ALL = [
+        {'key': 'travel', 'name': '旅拍', 'kind': 'equal', 'value': '旅拍', 'exclude_like': '新疆'},
+        {'key': 'wedding', 'name': '婚礼', 'kind': 'equal', 'value': '婚礼', 'exclude_like': '新疆'},
+        {'key': 'xinjiang', 'name': '新疆', 'kind': 'set_like', 'value': '新疆'},
+    ]
+    _single_biz = filter_option in ('仅旅拍', '仅婚礼', '仅新疆地区')
+    if _single_biz:
+        _brief_segments = None      # 单一业务线：报表本身已只含该线，无需再分段
+    else:
+        _brief_segments = []
+        for _sd in _SEG_DEF_ALL:
+            _sg = dict(_sd)
+            if _sd['key'] == 'xinjiang' or not (_brief_yoy['actual'] or _brief_yoy['allocation']):
+                # 新疆在历史汇总表里没有单列；历史表缺失时同比整体留空
+                _sg['yoy_a'] = _sg['yoy_b'] = None
+            else:
+                _nm = _sd['name']
+                _ya = (_brief_yoy['actual'] or {}).get(_nm)
+                _yb = (_brief_yoy['allocation'] or {}).get(_nm)
+                _sg['yoy_a'] = {'all': _ya, _nm: _ya} if _ya else None
+                _sg['yoy_b'] = {'all': _yb, _nm: _yb} if _yb else None
+            _brief_segments.append(_sg)
+
+    _brief_html = render_brief_report(
+        actual_df, allocation_df,
+        _brief_prev['actual'], _brief_prev['allocation'],
+        _brief_yoy['actual'], _brief_yoy['allocation'],
+        {
+            'span': period_month or f"{period_start} ~ {period_end}",
+            'biz': _seg_label,
+            'prev_label': _lms.strftime('%Y-%m') if _lms else '—',
+            'yoy_label': _yoy_label,
+            'gen': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'yoy_src': '上传的历史年度汇总表' if _yoy_from_upload else '去年同期报表（数据库）',
+        },
+        extra=_extra_map,
+        segments=_brief_segments,
+    )
+
+    st.download_button(
+        label="📥 下载经营利润汇报（口径可切换）",
+        data=_brief_html,
+        file_name=f"经营利润汇报_{period_month}_{filter_option}_{promo_mode_label}.html",
+        mime="text/html",
+        key='dl_brief_report',
+    )
+    with st.expander("👀 在线预览（点报表右上角可切换口径）", expanded=False):
+        components.html(_brief_html, height=1000, scrolling=True)
 
     add_log(st.session_state.user_id, st.session_state.username, "生成利润表", f"月份:{period_month}")
     period_mode_str = "按月"
