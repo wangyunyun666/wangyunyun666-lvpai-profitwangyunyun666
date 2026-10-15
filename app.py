@@ -58,6 +58,11 @@ SET_TYPE_MAP = {
     "16980新疆婚礼": "婚礼", "9999纯拍婚礼丽江": "婚礼",
 }
 
+# 系统认可的工资部门（唯一口径来源）。改动此列表时，必须同步
+# profit_engine.py 里的 salary_items（两处），否则该部门工资会计入不到人工成本。
+SALARY_DEPTS = ['策划部', '销售部', '运营部', '综合部', '总经办', '售后服务',
+                'AI与数据中心', '视频剪辑部']
+
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'user_id' not in st.session_state: st.session_state.user_id = None
 if 'username' not in st.session_state: st.session_state.username = None
@@ -90,7 +95,23 @@ def add_log(user_id, username, action, details=""):
     finally: db.close()
 
 def standardize_period(raw):
+    # 兼容数值型期间：Excel 日期序列号（如 46266 → 2026-09）、纯数字年月（如 202609）
+    # 背景：WPS/Excel 里同一列的单元格格式可能不一致，部分存成日期、部分是数字，
+    # 直接 str() 会得到 "46266" 这种错误期间，且混合类型会让 groupby 直接报错。
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and pd.notna(raw):
+        n = float(raw)
+        if n.is_integer():
+            ni = int(n)
+            if 190001 <= ni <= 300012:              # 202609 形式
+                return f"{ni // 100:04d}-{ni % 100:02d}"
+            if 1 <= ni <= 200000:                   # Excel 日期序列号（1899-12-30 起算）
+                ts = pd.Timestamp('1899-12-30') + pd.Timedelta(days=ni)
+                return f"{ts.year:04d}-{ts.month:02d}"
+    if isinstance(raw, (datetime, date, pd.Timestamp)):
+        return f"{raw.year:04d}-{raw.month:02d}"
     s = str(raw).strip()
+    if s.isdigit() and len(s) == 6:                 # "202609" 字符串形式
+        return f"{int(s[:4]):04d}-{int(s[4:]):02d}"
     if '年' in s and '月' in s:
         parts = s.replace('年', ' ').replace('月', '').split()
         if len(parts) >= 2:
@@ -996,7 +1017,7 @@ def view_profit_history_page():
         ('后期修片费(二销)', 'D', '二销订单后期修片成本'),
         ('工厂费用（一销）', 'D', '相册、相框等工厂制作费（一销）'),
         ('工厂费用（二销）', 'D', '相册、相框等工厂制作费（二销）'),
-        ('人工成本', 'D', '策划部、销售部、运营部、综合部、总经办、售后服务、AI与数据中心 7 个部门工资，按订单数分摊（计入直接成本）'),
+        ('人工成本', 'D', '策划部、销售部、运营部、综合部、总经办、售后服务、AI与数据中心、视频剪辑部 8 个部门工资，按订单数分摊（计入直接成本）'),
         ('房租、水电、办公费等', 'I', '固定运营成本分摊'),
         ('税费及手续费', 'I', '平台手续费、税费'),
         ('样片研发', 'I', '样片拍摄与研发投入'),
@@ -1907,7 +1928,7 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
         ('后期修片费(二销)', '后期修片费(二销)', '二销加修照片额外修片成本'),
         ('工厂费用（一销）', '工厂费用(一销)', '产品制作（相册、摆台等）一销部分'),
         ('工厂费用（二销）', '工厂费用(二销)', '产品制作二销加选部分'),
-        ('人工成本', '人工成本', '包含销售部、策划部、运营部、综合部、总经办、售后服务部门工资、AI与数据中心部门工资，按订单数分摊'),
+        ('人工成本', '人工成本', '包含销售部、策划部、运营部、综合部、总经办、售后服务部门工资、AI与数据中心部门工资、视频剪辑部门工资，按订单数分摊'),
         ('房租、水电、办公费等', '房租、水电、办公费等', '办公场所租赁、物业水电、日常办公消耗'),
         ('税费及手续费', '税费及手续费', '各项税金、支付平台手续费等'),
         ('样片研发', '样片研发', '包含新疆拍样费用、样片研发及模特道具等支出'),
@@ -4052,28 +4073,41 @@ def indirect_cost_page():
     with st.expander("📤 工资批量导入（年月-部门-旅拍-婚礼，可多期）", expanded=False):
         st.markdown("""
         **文件格式**：列名必须为 `年月`、`部门`、`旅拍`、`婚礼`  
-        部门如：策划部、销售部等，系统将自动加上“工资”后缀存储。
+        部门如：策划部、销售部等，系统将自动加上“工资”后缀存储。  
+        ⚠️ 系统认可的工资部门为：**策划部 / 销售部 / 运营部 / 综合部 / 总经办 / 售后服务 / AI与数据中心 / 视频剪辑部**；
+        其它名称的部门**不会计入人工成本**，请先确认部门名称。
         """)
         uploaded_salary = st.file_uploader("上传工资Excel", type="xlsx", key="salary_upload")
         if uploaded_salary:
             df_s = pd.read_excel(uploaded_salary)
+            # 容错：列名/部门名去掉前后空格（Excel 里极易带上，会导致匹配失败）
+            df_s.columns = [str(c).strip() for c in df_s.columns]
+            # 期间列归一化：同一列可能混有「日期」与「数字(Excel序列号)」，不统一会让分组报错
+            if '年月' in df_s.columns:
+                df_s['年月'] = df_s['年月'].map(standardize_period)
             if can_see:
                 st.write("预览：", df_s.head())
             else:
                 st.write("预览：", mask_dataframe(df_s.head()))
             if all(c in df_s.columns for c in ['年月', '部门', '旅拍', '婚礼']):
+                unknown = sorted({str(d).strip() for d in df_s['部门'].dropna().unique()
+                                  if str(d).strip() and str(d).strip() not in SALARY_DEPTS})
+                if unknown:
+                    st.warning("⚠️ 以下部门系统不认可，导入后**不会计入人工成本**，请先确认：「"
+                               + "」「".join(unknown) + "」。认可的部门为：" + " / ".join(SALARY_DEPTS), icon="⚠️")
                 if st.button("导入工资（多期）"):
                     db = SessionLocal()
                     try:
+                        df_s['部门'] = df_s['部门'].astype(str).str.strip()
                         grouped = df_s.groupby(['年月', '部门']).agg({'旅拍': 'sum', '婚礼': 'sum'}).reset_index()
                         for _, row in grouped.iterrows():
                             p = standardize_period(row['年月'])
-                            dept = str(row['部门']) + '工资'
+                            dept = str(row['部门']).strip() + '工资'
                             db.query(IndirectCost).filter_by(period=p, cost_item=dept).delete()
                         db.commit()
                         for _, row in grouped.iterrows():
                             p = standardize_period(row['年月'])
-                            dept = str(row['部门']) + '工资'
+                            dept = str(row['部门']).strip() + '工资'
                             travel_amt = float(row['旅拍']) if pd.notna(row['旅拍']) else 0
                             wedding_amt = float(row['婚礼']) if pd.notna(row['婚礼']) else 0
                             for bt, amt in [('旅拍', travel_amt), ('婚礼', wedding_amt)]:
@@ -4088,6 +4122,9 @@ def indirect_cost_page():
                     finally: db.close()
             else:
                 st.error("缺少必要列：年月、部门、旅拍、婚礼")
+        else:
+            st.caption("提示：文件上传完成后，**本框下方**会依次出现「预览」表格和 **导入工资（多期）** 按钮，"
+                       "请稍等 2~3 秒（页面会自动刷新）再向下查看。")
 
     with st.expander("📤 间接费用批量导入（期间-业务类型-费用项-金额，可多期）", expanded=False):
         st.markdown("""
@@ -4105,6 +4142,9 @@ def indirect_cost_page():
         uploaded_indirect = st.file_uploader("上传间接费用Excel", type="xlsx", key="indirect_upload")
         if uploaded_indirect:
             df_i = pd.read_excel(uploaded_indirect)
+            df_i.columns = [str(c).strip() for c in df_i.columns]
+            if '期间' in df_i.columns:
+                df_i['期间'] = df_i['期间'].map(standardize_period)
             if can_see:
                 st.write("预览：", df_i.head())
             else:
@@ -4140,9 +4180,8 @@ def indirect_cost_page():
     st.subheader("旅拍 & 婚礼 分项间接费用")
     st.caption(
         "⚠️ **「样片研发」只填新疆以外的拍样费用**；新疆拍样费用请走「🏜️ 新疆拍样/报销费用」单独导入。")
-    cost_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资',
-                  '售后服务工资','AI与数据中心工资','房租、水电、办公费等','税费及手续费',
-                  '样片研发','场地铺设费','舆情处理']
+    cost_items = [d + '工资' for d in SALARY_DEPTS] + [
+        '房租、水电、办公费等', '税费及手续费', '样片研发', '场地铺设费', '舆情处理']
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("#### 📸 旅拍")

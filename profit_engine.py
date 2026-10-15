@@ -153,7 +153,7 @@ def generate_profit_report(period_start, period_end, promo_mode='actual'):
         travel_promo = 0.0
         wedding_promo = 0.0
 
-        salary_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资','售后服务工资','AI与数据中心工资']
+        salary_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资','售后服务工资','AI与数据中心工资','视频剪辑部工资']
         indirect_items = ['房租、水电、办公费等','税费及手续费','样片研发','场地铺设费','舆情处理']
 
         for inv in rows:
@@ -532,7 +532,7 @@ def generate_profit_report_multi_month(*period_months, promo_mode='actual'):
     # ========== 重新按总期间统一分摊人工成本 ==========
     db = SessionLocal()
     try:
-        salary_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资','售后服务工资','AI与数据中心工资']
+        salary_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资','售后服务工资','AI与数据中心工资','视频剪辑部工资']
 
         travel_salary = {item: 0.0 for item in salary_items}
         wedding_salary = {item: 0.0 for item in salary_items}
