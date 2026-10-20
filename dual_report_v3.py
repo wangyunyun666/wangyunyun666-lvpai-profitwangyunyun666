@@ -283,6 +283,19 @@ def render(cur_a, cur_b, prev_a, prev_b, yoy_a, yoy_b, meta, extra=None, segment
     if segments:
         return _render_segments(cur_a, cur_b, prev_a, prev_b, yoy_a, yoy_b,
                                 meta, extra, segments)
+    return _TPL.replace('/*__BODY__*/',
+                        _render_inner(cur_a, cur_b, prev_a, prev_b, yoy_a, yoy_b,
+                                      meta, extra))
+
+
+def _render_inner(cur_a, cur_b, prev_a, prev_b, yoy_a, yoy_b, meta, extra=None):
+    """生成报表「主体 HTML 片段」（不含 <html>/<style>/<script> 外壳）。
+
+    ⚠️ 分业务线导出时必须用本函数，不能用 render()：
+    早前 _render_segments 直接拼 render() 的返回值，等于把「整份文档」塞进
+    「整份文档」，导出的 HTML 里出现 1 个外层 + N 个内层的 DOCTYPE/<head>/<style>/
+    <script>，文件因此膨胀约 4 倍，复制进 Word / 邮件预览时格式易乱。
+    """
     span = meta.get('span', '')
     biz = meta.get('biz', '全部')
     pl = meta.get('prev_label') or '上期'
@@ -313,7 +326,7 @@ def render(cur_a, cur_b, prev_a, prev_b, yoy_a, yoy_b, meta, extra=None, segment
         f"<div class='sub'>动态口径切换 · 含同比 / 环比 / 均价</div>"
         f"<div class='meta'>业务范围：{_e(biz)}　·　拍摄订单 {q_a:,.0f} 单"
         f"　·　生成时间：{_e(gen)}</div>"
-        "<div class='sw' id='sw'>"
+        "<div class='sw'>"
         "<button class='sw-b on' data-m='a'>实际口径</button>"
         + ("<button class='sw-b' data-m='b'>分摊口径</button>" if has_b else "")
         + ("<button class='sw-b' data-m='both'>两口径对照</button>" if has_b else "")
@@ -340,7 +353,7 @@ def render(cur_a, cur_b, prev_a, prev_b, yoy_a, yoy_b, meta, extra=None, segment
         _notice('两口径对照需要同一期导出「实际口径」与「分摊口径」两份报表。')
     body += "</div>"
     body += _foot(span, biz, gen, has_yoy, has_prev, pl, yl, meta.get('yoy_src'))
-    return _TPL.replace('/*__BODY__*/', body)
+    return body
 
 
 def _notice(txt):
@@ -406,7 +419,7 @@ def _render_segments(cur_a, cur_b, prev_a, prev_b, yoy_a, yoy_b, meta, extra, se
 
         inner = (f"<div class='seg' id='seg-{_e(seg.get('key', i))}'>"
                  f"<div class='seg-hd'>{_e(seg.get('name', seg.get('key', '')))}</div>")
-        inner += render(ca, cb, pa, pb, ya, yb, meta2, extra=ex)
+        inner += _render_inner(ca, cb, pa, pb, ya, yb, meta2, extra=ex)
         inner += "</div>"
         parts.append(inner)
 

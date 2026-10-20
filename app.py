@@ -2223,6 +2223,11 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
 
         for idx, biz_type in enumerate(tabs_to_show):
             with tabs[idx]:
+                # 每条业务线独立起算：这三个附表变量在下面的分支里不一定都会赋值，
+                # 若沿用上一条业务线的残留值，导出时会把「旅拍」的附表挂到「婚礼」上。
+                detail_df = pd.DataFrame()
+                salary_df = pd.DataFrame()
+                df_avg = pd.DataFrame()
                 if biz_type == "全部业务":
                     df_biz = df_data
                     total_orders = df_biz['套系数量'].sum()
@@ -2984,10 +2989,14 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
 - 存量员工变动影响占总变化：**{abs(total_staying) / abs(r['total_change']) * 100 if r['total_change'] else 0:.1f}%**
 """)
 
-                # 保存当前业务类型的 DataFrames 供导出使用
-                st.session_state[f'avg_df_{biz_type}'] = df_avg
-                st.session_state[f'detail_df_{biz_type}'] = detail_df if 'detail_df' in locals() else pd.DataFrame()
-                st.session_state[f'salary_df_{biz_type}'] = salary_df if 'salary_df' in locals() else pd.DataFrame()
+                # 保存当前业务类型的 DataFrames 供导出使用。
+                # key 里带「期间 + 费用口径」，两个口径各存一份、互不覆盖：
+                # 用户在页面上把口径切换看过一次后，导出即可一次性带齐两套附表
+                # （见导出段 _ex_a / _ex_b），不必再导第二个文件。
+                _sig = f"{period_start:%Y%m%d}-{period_end:%Y%m%d}"
+                st.session_state[f'avg_df__{biz_type}__{_sig}__{promo_mode}'] = df_avg
+                st.session_state[f'detail_df__{biz_type}__{_sig}__{promo_mode}'] = detail_df
+                st.session_state[f'salary_df__{biz_type}__{_sig}__{promo_mode}'] = salary_df
 
     # ==================== 转化率展示区块（毛客数 ÷ 订单数） ====================
     st.divider()
@@ -3141,9 +3150,22 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
     report_data_json = json.dumps(report_payload, ensure_ascii=False)
     json.loads(report_data_json)  # 自检：确保序列化结果无 NaN/NaT 非法字面量
 
-    avg_df = st.session_state.get(f'avg_df_{export_biz_type}', pd.DataFrame())
-    detail_df = st.session_state.get(f'detail_df_{export_biz_type}', pd.DataFrame())
-    salary_df = st.session_state.get(f'salary_df_{export_biz_type}', pd.DataFrame())
+    # 附表（费用明细 / 人工部门 / 均价）按「期间 + 业务范围 + 口径」缓存。
+    # 两个口径各取一份：当前口径 + 另一口径（后者只要用户在本次会话里把口径切换
+    # 看过一次，就已经算好并存在 session 里），从而实现「一次导出，两个口径附表都齐」。
+    _sig_x = f"{period_start:%Y%m%d}-{period_end:%Y%m%d}"
+    _cur_mode = promo_mode
+    _oth_mode = 'allocation' if promo_mode == 'actual' else 'actual'
+
+    def _get_extra_dfs(_mode):
+        return (
+            st.session_state.get(f'avg_df__{export_biz_type}__{_sig_x}__{_mode}', pd.DataFrame()),
+            st.session_state.get(f'detail_df__{export_biz_type}__{_sig_x}__{_mode}', pd.DataFrame()),
+            st.session_state.get(f'salary_df__{export_biz_type}__{_sig_x}__{_mode}', pd.DataFrame()),
+        )
+
+    avg_df, detail_df, salary_df = _get_extra_dfs(_cur_mode)
+    avg_df_o, detail_df_o, salary_df_o = _get_extra_dfs(_oth_mode)
 
     def df_to_html_rows(df, columns):
         if df is None or df.empty:
@@ -3383,17 +3405,33 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                 _yoy_from_upload = True
 
     # ---- 附录：把系统已算好的三个分析块（费用明细 / 人工部门 / 均价）转成汇报的附表
-    _ex_cur = [x for x in (
-        _extra_rows(detail_df, shoot_columns, '📸 拍摄费用明细分析（含同比）'),
-        _extra_rows(salary_df, labor_columns, '💼 人工成本分析（部门均价同比）'),
-        _extra_rows(avg_df, avg_columns, '📈 均价及同比环比分析'),
-    ) if x]
+    # 两个口径各生成一套：当前口径用本次页面算好的；另一口径用会话里缓存的那套。
+    # 两边都齐 → 一个文件带齐两套附表，不用再导第二份。
+    def _build_extras(_avg, _detail, _salary):
+        return [x for x in (
+            _extra_rows(_detail, shoot_columns, '📸 拍摄费用明细分析（含同比）'),
+            _extra_rows(_salary, labor_columns, '💼 人工成本分析（部门均价同比）'),
+            _extra_rows(_avg, avg_columns, '📈 均价及同比环比分析'),
+        ) if x]
+
+    _ex_cur = _build_extras(avg_df, detail_df, salary_df)
+    _ex_oth = _build_extras(avg_df_o, detail_df_o, salary_df_o)
+
     _other_name = '实际口径' if promo_mode == 'allocation' else '分摊口径'
     _notice_other = ('__notice__',
-                     f"本视图的费用与均价明细未随口径联算：系统当前选择的是「{promo_mode_label}」。"
-                     f"把左侧「费用口径」切到「{_other_name}」再导一次，本视图即显示该口径的对应数字。", [])
-    _extra_map = ({'a': _ex_cur, 'b': [_notice_other]} if promo_mode == 'actual'
-                  else {'a': [_notice_other], 'b': _ex_cur})
+                     f"本视图的费用与均价明细尚未计算：本次导出时「{_other_name}」还不在会话缓存里。"
+                     f"左侧「费用口径」切到「{_other_name}」看一眼（页面会自动算好并缓存），"
+                     f"再切回来导出，这一个文件里两个口径的附表就都齐了，无需再导第二份。", [])
+
+    def _pick_extras(_own, _fallback_notice):
+        return _own if _own else [_fallback_notice]
+
+    if promo_mode == 'actual':
+        _extra_map = {'a': _pick_extras(_ex_cur, _notice_other),
+                      'b': _pick_extras(_ex_oth, _notice_other)}
+    else:
+        _extra_map = {'a': _pick_extras(_ex_oth, _notice_other),
+                      'b': _pick_extras(_ex_cur, _notice_other)}
 
     _yoy_label = (_lys.strftime('%Y-%m')
                   if (_lys.year == _lye.year and _lys.month == _lye.month)
