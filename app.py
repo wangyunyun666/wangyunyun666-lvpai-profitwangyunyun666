@@ -4192,23 +4192,40 @@ def indirect_cost_page():
                 if st.button("导入间接费用（多期）"):
                     db = SessionLocal()
                     try:
+                        # 第一步：先校验、再落库。绝不「先删除后丢弃」，避免静默丢数据。
+                        _rows_ok, _rows_bad = [], []
                         for _, row in df_i.iterrows():
                             p = standardize_period(row['期间'])
-                            bt = str(row['业务类型'])
-                            item = str(row['费用项'])
+                            bt = str(row['业务类型']).strip()
+                            item = str(row['费用项']).strip()
+                            amt = float(row['金额'])
+                            if bt in ('旅拍', '婚礼'):
+                                _rows_ok.append((p, bt, item, amt))
+                            elif bt == '新疆' and item in ('新疆拍样费用', '新疆报销费用'):
+                                # 新疆专项费用允许从本页一并导入，引擎会合并进「样片研发」列
+                                _rows_ok.append((p, '新疆', item, amt))
+                            else:
+                                _rows_bad.append(f"{p}｜{bt}｜{item}｜¥{amt:,.2f}")
+                        for p, bt, item, amt in _rows_ok:
                             db.query(IndirectCost).filter_by(period=p, cost_item=item, business_type=bt).delete()
                         db.commit()
-                        for _, row in df_i.iterrows():
-                            p = standardize_period(row['期间'])
-                            bt = str(row['业务类型'])
-                            item = str(row['费用项'])
-                            amt = float(row['金额'])
-                            if bt not in ('旅拍', '婚礼'): continue
+                        for p, bt, item, amt in _rows_ok:
                             db.add(IndirectCost(period=p, cost_item=item, business_type=bt, amount=amt))
                         db.commit()
-                        msg = "间接费用批量导入成功！" if can_see else "间接费用批量导入成功（数量已隐藏）"
-                        st.success(msg)
-                        st.rerun()
+                        if _rows_ok:
+                            st.success(f"间接费用批量导入成功！共 {len(_rows_ok)} 条" if can_see
+                                       else "间接费用批量导入成功（数量已隐藏）")
+                        if _rows_bad:
+                            st.error(
+                                f"有 {len(_rows_bad)} 行**没有导入**（业务类型无法识别）：\n\n"
+                                + "\n".join(f"- {x}" for x in _rows_bad[:20])
+                                + (f"\n- ……共 {len(_rows_bad)} 行" if len(_rows_bad) > 20 else "")
+                                + "\n\n业务类型只能是「旅拍」或「婚礼」；"
+                                  "新疆拍样/报销请填「新疆」且费用项为「新疆拍样费用」或「新疆报销费用」，"
+                                  "或改用「🏜️ 新疆拍样/报销费用」页导入。"
+                            )
+                        if not _rows_bad:
+                            st.rerun()
                     except Exception as e:
                         db.rollback(); st.error(f"导入失败：{e}")
                     finally: db.close()
@@ -5825,6 +5842,28 @@ def xinjiang_expense_import_page():
     - 这些费用将存入间接费用表，在利润表中按新疆选片订单数分摊。  
     - 重复导入同一期间同费用项会自动覆盖。
     """)
+    with st.expander("📋 已导入的新疆费用（自查用）", expanded=False):
+        _db_chk = SessionLocal()
+        try:
+            _recs = _db_chk.query(IndirectCost).filter(
+                IndirectCost.business_type == '新疆',
+                IndirectCost.cost_item.in_(['新疆拍样费用', '新疆报销费用'])
+            ).order_by(IndirectCost.period.desc()).all()
+            if _recs:
+                _df_chk = pd.DataFrame([{'期间': r.period, '费用项': r.cost_item, '金额': r.amount} for r in _recs])
+                _df_chk['期间'] = _df_chk['期间'].astype(str)
+                if can_see:
+                    st.dataframe(_df_chk, width='stretch', hide_index=True)
+                    st.caption(f"共 {len(_df_chk)} 条，合计 ¥{float(_df_chk['金额'].sum()):,.2f}。"
+                               f"利润表里「新疆」业务线的「样片研发」= 此处「新疆拍样费用」按新疆订单数分摊后的结果；"
+                               f"本月没有记录，利润表新疆那一栏的样片研发就会是 0。")
+                else:
+                    st.dataframe(mask_dataframe(_df_chk), width='stretch')
+            else:
+                st.warning("目前一条新疆费用都没有导入过。若本月确实发生了新疆拍样费，"
+                           "请在上方上传 Excel 补录，否则利润表「新疆」的「样片研发」会是 0。")
+        finally:
+            _db_chk.close()
     uploaded = st.file_uploader("上传新疆费用Excel", type=["xlsx", "xls"])
     if uploaded:
         df = pd.read_excel(uploaded)
@@ -7026,7 +7065,7 @@ def rule_explanation_page():
     - **人工成本（工资）**：按业务类型（旅拍/婚礼）各自汇总所有部门工资，除以各自的选片订单数得到均价，再乘以每个套系的订单数进行分摊。新疆业务：新疆旅拍套系使用旅拍业务的部门工资均价，新疆婚礼套系使用婚礼业务的部门工资均价。
     - **推广费**：先根据“推广费分摊设置”中的婚礼占比，将总推广费拆分为旅拍推广费和婚礼推广费。旅拍推广费按旅拍选片订单数分摊；婚礼推广费按婚礼选片订单数分摊。新疆业务：新疆旅拍套系使用旅拍推广费均价，新疆婚礼套系使用婚礼推广费均价。
     - **其他间接费用（房租水电、税费及手续费、样片研发、场地铺设费、舆情处理）**：旅拍和婚礼分别汇总各自这些项目的金额。先按业务类型内部分摊（各自按选片订单数），再与新疆套系共同参与全局分摊。新疆业务：新疆旅拍使用旅拍该类费用的均价，新疆婚礼使用婚礼均价。**场地铺设费**：特指无法分入具体订单的场地公共费用，处理方式同上。
-    - **新疆拍样费用**：单独汇总所有期间的新疆拍样费用（business_type='新疆'），按新疆选片订单总数（含所有新疆套系）进行均摊，并**合并入“样片研发”列**展示。新疆报销费用若导入，将作为单独列显示在利润表中，并按同样规则分摊。
+    - **新疆拍样费用**：单独汇总**所选期间**的新疆拍样费用（business_type='新疆'、费用项='新疆拍样费用'，须从「🏜️ 新疆拍样/报销费用」页或「📈 录入间接成本」批量导入时业务类型填「新疆」），按新疆选片订单总数（含所有新疆套系）进行均摊，并**合并入“样片研发”列**展示。**未导入时该金额为 0，利润表「新疆」业务线的「样片研发」就显示 0**。新疆报销费用若导入，将作为单独列显示在利润表中，并按同样规则分摊。
     - **分摊特殊情况**：如果某业务类型（如旅拍）在所选期间内订单数为0，则其对应费用不分摊，避免除零错误。
 
     ## 四、推广费分摊设置
