@@ -5624,14 +5624,18 @@ def retouch_bill_import_page():
         try:
             oids = [r[0] for r in records]
             existing_orders = db.query(Order).filter(Order.order_id.in_(oids)).all()
-            existing_map = {o.order_id: (o.actual_retouch_fee or 0) for o in existing_orders}
-            duplicates_info = [(oid, existing_map.get(oid, 0), amt) for oid, amt in records if oid in existing_map]
+            # 只把「已有修片费 > 0」的订单算作重复：
+            # 金额为 0 的订单其实从未导入过修片费，属于「首次导入」，不需要逐单确认，
+            # 否则每次导入都会列出上千行（且选「仅导入新记录」还会把它们错误跳过）。
+            existing_map = {o.order_id: float(o.actual_retouch_fee)
+                            for o in existing_orders if (o.actual_retouch_fee or 0) > 0}
+            duplicates_info = [(oid, existing_map[oid], amt) for oid, amt in records if oid in existing_map]
         finally:
             db.close()
 
         if duplicates_info:
             if can_see:
-                st.warning(f"检测到 {len(duplicates_info)} 个订单已有修片费，请选择：")
+                st.warning(f"检测到 {len(duplicates_info)} 个订单已有修片费（金额大于 0），请选择处理方式：")
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")

@@ -109,6 +109,42 @@ _IC_STAGES = [
 # 展示用：阶段序号 → 该阶段内条目数（用于顶部进度概览）
 _IC_TOTAL = sum(len(items) for _, _, items in _IC_STAGES)
 
+# app.py 脚本的全局命名空间。在 import_center_page() 被调用时捕获——
+# import_center_page 由 app.py 在模块层直接调用，上一层帧就是 app.py 脚本本身，
+# 它的全局命名空间里必然有全部页面函数。这是三层兜底中最可靠的一层。
+_SRC_GLOBALS = None
+
+
+def _resolve_page_fn(fn: str):
+    """按可靠性从高到低，三层兜底解析 app.py 里的页面函数。
+
+    背景：原实现只认 `sys.modules["__main__"]`——旧版 Streamlit 会把运行中的
+    脚本注册为 __main__ 模块。但 requirements.txt 里 streamlit 未锁版本，
+    云端重建环境时会拉到新版 Streamlit，脚本可能不再以 __main__ 身份注册，
+    导致所有模块都报「未找到导入模块」。因此改为三层兜底，任何一层命中即可，
+    与 Streamlit 版本无关。
+    """
+    # 1) 调用者（app.py 脚本本身）的全局命名空间 —— 最可靠
+    if _SRC_GLOBALS is not None:
+        t = _SRC_GLOBALS.get(fn)
+        if callable(t):
+            return t
+    # 2) __main__ 模块（旧版 Streamlit 行为）
+    main = sys.modules.get("__main__")
+    if main is not None:
+        t = getattr(main, fn, None)
+        if callable(t):
+            return t
+    # 3) 扫描已加载模块：谁「定义」了这个函数（而非仅 import 过来）就用谁
+    for mod in list(sys.modules.values()):
+        try:
+            t = getattr(mod, fn, None)
+        except Exception:
+            continue
+        if callable(t) and getattr(t, "__module__", None) == getattr(mod, "__name__", None):
+            return t
+    return None
+
 
 def _ic_render_item(idx: int, title: str, desc: str, fn, expanded: bool, tip: str | None):
     """渲染单个导入项：标题 + 说明 + 提示，展开后直接调用原页面函数。
@@ -116,14 +152,14 @@ def _ic_render_item(idx: int, title: str, desc: str, fn, expanded: bool, tip: st
     注意：**不能用 `import app` 取函数**。app.py 是脚本式入口（模块级就会执行
     登录判断与路由分发），再次 import 会让整段入口逻辑跑第二遍，从而创建出
     第二个 `key='nav_menu'` 的控件并抛 StreamlitDuplicateElementKey。
-    正确做法是从 `__main__`（当前正在运行的脚本本身）里取函数。
+    正确做法是通过 _resolve_page_fn() 取当前运行脚本里的函数（三层兜底）。
     """
     label = f"{idx}. {title}"
     with st.expander(label, expanded=expanded):
         st.caption(desc)
         if tip:
             st.info(tip, icon="💡")
-        target = getattr(sys.modules.get("__main__"), fn, None)
+        target = _resolve_page_fn(fn)
         if target is None:
             st.error(f"未找到导入模块 `{fn}`，请联系管理员。")
             return
@@ -136,6 +172,17 @@ def _ic_render_item(idx: int, title: str, desc: str, fn, expanded: bool, tip: st
 
 def import_center_page():
     """数据导入中心首页。"""
+    global _SRC_GLOBALS
+    # 捕获调用者（app.py 脚本本身）的全局命名空间，供 _resolve_page_fn 使用。
+    # 加一道保险：确认这份命名空间确实是 app.py 的（含有其中的页面函数），
+    # 防止未来调用方式变化后误存了别的东西。
+    try:
+        g = sys._getframe(1).f_globals
+        if "profit_report_page" in g or "login_page" in g:
+            _SRC_GLOBALS = g
+    except Exception:
+        pass
+
     st.header("📥 数据导入中心")
     st.caption(
         "把系统里所有导入入口按**建议录入顺序**集中在这一页。"
