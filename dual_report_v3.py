@@ -883,8 +883,13 @@ def _tips(cur, prev, yoy, mm, idx, name, inc, prof, rate, span, pl, yl, has_prev
             f"<b>亏损面</b>：{name}下 <b>{loss}</b> 个套系亏损，其中 <b>{len(both)}</b> 个两个口径都亏"
             f"（真实亏损，建议核对成本并评估是否继续售卖）；"
             f"<b>{len(sens)}</b> 个仅在本口径亏损（对人工与推广分摊敏感，可优先调价或控投放）。")
+        if wa < 0:
+            _tip_worst = (f"<b>最需关注</b>：<b>{_e(wn)}</b> 净亏 <b>{_w(abs(wa))} 万元</b>，为亏损最大套系；")
+        else:
+            _tip_worst = (f"<b>最需关注</b>：<b>{_e(wn)}</b> 净利 <b>{_w(wa)} 万元</b>，"
+                          f"为{name.replace('口径', '')}利润最低的套系（该口径下无亏损套系，不存在亏损）；")
         tips.append(
-            f"<b>最需关注</b>：<b>{_e(wn)}</b> 净亏 <b>{_w(abs(wa))} 万元</b>，为亏损最大套系；"
+            _tip_worst +
             f"<b>{_e(bn)}</b> 净赚 <b>{_w(ba)} 万元</b>，为利润最大贡献套系。")
 
     pro, sal = cur['推广'], cur['人工']
