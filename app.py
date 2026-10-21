@@ -1960,7 +1960,7 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
         ('工厂费用（二销）', '工厂费用(二销)', '产品制作二销加选部分'),
         ('人工成本', '人工成本', '包含销售部、策划部、运营部、综合部、总经办、售后服务部门工资、AI与数据中心部门工资、视频剪辑部门工资，按订单数分摊'),
         ('房租、水电、办公费等', '房租、水电、办公费等', '办公场所租赁、物业水电、日常办公消耗'),
-        ('税费及手续费', '税费及手续费', '各项税金、支付平台手续费等'),
+        ('税费及手续费', '税费及手续费', '各项税金、支付平台手续费等；银行结息等收入以负数冲减'),
         ('样片研发', '样片研发', '包含新疆拍样费用、样片研发及模特道具等支出'),
         ('场地铺设费', '场地铺设费', '无法归属到具体订单的公共场地布置费用'),
         ('舆情处理', '舆情处理', '种草推广、舆情维护等费用')
@@ -4366,7 +4366,8 @@ def indirect_cost_page():
     with st.expander("📤 间接费用批量导入（期间-业务类型-费用项-金额，可多期）", expanded=False):
         st.markdown("""
         **文件格式**：必须包含列 `期间`、`业务类型`（旅拍/婚礼）、`费用项`、`金额`  
-        费用项可使用：`房租、水电、办公费等`、`税费及手续费`、`样片研发`、`场地铺设费`、`舆情处理` 等。
+        费用项可使用：`房租、水电、办公费等`、`税费及手续费`、`样片研发`、`场地铺设费`、`舆情处理` 等。  
+        💡 **银行结息等收入请填负数冲减**：如结息记在「税费及手续费」里，金额填「手续费支出 − 结息收入」的净额；结息大于手续费时直接填负数，报表里这项会变成负成本、利润相应增加。同一期间+费用项+业务类型重新导入会覆盖旧值。
         """)
         st.warning(
             "**「样片研发」只填新疆以外的拍样费用。** "
@@ -4436,13 +4437,15 @@ def indirect_cost_page():
         "⚠️ **「样片研发」只填新疆以外的拍样费用**；新疆拍样费用请走「🏜️ 新疆拍样/报销费用」单独导入。")
     cost_items = [d + '工资' for d in SALARY_DEPTS] + [
         '房租、水电、办公费等', '税费及手续费', '样片研发', '场地铺设费', '舆情处理']
+    # 这 5 个间接费用项允许负数（银行结息等收入以负数冲减，如结息记在「税费及手续费」）
+    _NEG_OK = {'房租、水电、办公费等', '税费及手续费', '样片研发', '场地铺设费', '舆情处理'}
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("#### 📸 旅拍")
-        travel_vals = {item: st.number_input(f"{item}", min_value=0.0, value=saved.get((item, '旅拍'), 0.0), step=100.0, key=f"t_{item}", disabled=not can_see) for item in cost_items}
+        travel_vals = {item: st.number_input(f"{item}", min_value=(None if item in _NEG_OK else 0.0), value=saved.get((item, '旅拍'), 0.0), step=100.0, key=f"t_{item}", disabled=not can_see) for item in cost_items}
     with col2:
         st.markdown("#### 💒 婚礼")
-        wedding_vals = {item: st.number_input(f"{item}", min_value=0.0, value=saved.get((item, '婚礼'), 0.0), step=100.0, key=f"w_{item}", disabled=not can_see) for item in cost_items}
+        wedding_vals = {item: st.number_input(f"{item}", min_value=(None if item in _NEG_OK else 0.0), value=saved.get((item, '婚礼'), 0.0), step=100.0, key=f"w_{item}", disabled=not can_see) for item in cost_items}
     st.divider()
     st.subheader("📢 推广费（总额，系统按加权订单数自动拆分）")
     promo_total = st.number_input("推广费总额", min_value=0.0, value=float(saved.get('travel_promo',0)+saved.get('wedding_promo',0)), step=100.0, key="promo_total", disabled=not can_see)
