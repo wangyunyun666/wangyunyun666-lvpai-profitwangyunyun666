@@ -2586,9 +2586,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                 # ==================== 拍摄费用明细分析（含同比、环比） ====================
                 st.divider()
                 with st.expander(f"📸 {biz_type}拍摄费用明细分析（含同比）", expanded=False):
-                    st.caption("💡 看表须知：这里的「均价」是把这项费用平摊到当月所有订单上算出来的，没产生这笔费用的订单也算进去了。"
-                               "所以订单变多、发生这笔费用的订单变少，均价都会自然变小 —— 看到涨跌不能直接当成涨价或降价，"
-                               "建议对照页面顶部的订单总数一同判断。")
+                    st.caption("💡 看表须知：这里的「均价」= 该子项金额 ÷ **真正发生这笔费用的选片订单数**（见「发生订单数」列），"
+                               "没产生这笔费用的订单不再摊入 —— 所以各子项相加不再等于底部总均价（分母不同），"
+                               "但每个数字都回答“这笔费用发生时平均花多少”，同比、环比也不再受订单总量波动干扰。")
                     db2 = SessionLocal()
                     if biz_type == "全部业务":
                         # 取 order_id 的同时取 set_name，用于剔除「一纸情书」内部单：
@@ -2644,6 +2644,7 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
 
                     def build_detail_rows(records, order_count):
                         detail_sums = {}
+                        cover_sets = {}   # 每个明细项目「实际发生该费用」的订单集合（去重）
                         parse_fail = 0
                         for rec in records:
                             if rec.remark and '||解析:' in rec.remark:
@@ -2656,9 +2657,11 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                             try:
                                                 val = float(val_str)
                                                 detail_sums[key] = detail_sums.get(key, 0) + val
+                                                cover_sets.setdefault(key, set()).add(rec.order_id)
                                             except: parse_fail += 1
                             else:
                                 detail_sums['其他'] = detail_sums.get('其他', 0) + rec.amount
+                                cover_sets.setdefault('其他', set()).add(rec.order_id)
                         if parse_fail > 0:
                             st.warning(f"有 {parse_fail} 条拍摄费用明细解析失败已跳过，请核对数据。")
                         total = sum(rec.amount for rec in records)
@@ -2670,23 +2673,30 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                             else:
                                 detail_sums['摄化费用'] = diff
                         avg_dict = {k: v / order_count if order_count else 0 for k, v in detail_sums.items()}
-                        return avg_dict, total
+                        cover_cnt = {k: len(cover_sets.get(k, ())) for k in detail_sums}
+                        cover_avg = {k: (detail_sums[k] / cover_cnt[k] if cover_cnt.get(k) else 0.0)
+                                     for k in detail_sums}
+                        return avg_dict, total, cover_cnt, cover_avg
 
-                    curr_detail, curr_total = build_detail_rows(shoot_records, total_orders)
-                    curr_shoot_avg = curr_total / total_orders if total_orders else 0
+                    curr_detail, curr_total, curr_cover_cnt, curr_cover_avg = build_detail_rows(shoot_records, total_orders)
+                    # 全表统一「发生口径」：底部合计也用 真正有拍摄费用的订单数 作分母，
+                    # 与各子项、与上月/去年合计保持同一分母定义，否则同比环比会自相矛盾。
+                    curr_cov_orders = len({r.order_id for r in shoot_records})
+                    curr_shoot_avg = curr_total / curr_cov_orders if curr_cov_orders else 0
 
                     lm_detail, lm_total = {}, 0
+                    lm_cover_cnt, lm_cover_avg = {}, {}
+                    lm_shoot_avg = None
                     if last_month_start and last_month_end:
                         lm_order_count = len(lm_orders) if lm_orders else 0
                         if lm_order_count > 0:
-                            lm_detail, lm_total = build_detail_rows(lm_shoot_records, lm_order_count)
-                            lm_shoot_avg = lm_total / lm_order_count
-                        else:
-                            lm_shoot_avg = None
-                    else:
-                        lm_shoot_avg = None
+                            lm_detail, lm_total, lm_cover_cnt, lm_cover_avg = build_detail_rows(lm_shoot_records, lm_order_count)
+                            lm_cov_orders = len({r.order_id for r in lm_shoot_records})
+                            lm_shoot_avg = (lm_total / lm_cov_orders) if lm_cov_orders else None
 
                     ly_detail, ly_total = {}, 0
+                    ly_cover_cnt, ly_cover_avg = {}, {}
+                    ly_shoot_avg = None
                     ly_order_count = 0
                     if last_year_start.year >= 2025:
                         db3 = SessionLocal()
@@ -2714,36 +2724,40 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                         ).all()
                         ly_order_count = len(ly_order_ids)
                         if ly_order_count > 0:
-                            ly_detail, ly_total = build_detail_rows(ly_records, ly_order_count)
-                            ly_shoot_avg = ly_total / ly_order_count
-                        else:
-                            ly_shoot_avg = None
+                            ly_detail, ly_total, ly_cover_cnt, ly_cover_avg = build_detail_rows(ly_records, ly_order_count)
+                            ly_cov_orders = len({r.order_id for r in ly_records})
+                            ly_shoot_avg = (ly_total / ly_cov_orders) if ly_cov_orders else None
                         db3.close()
-                    else:
-                        ly_shoot_avg = None
 
                     all_keys = sorted(set(list(curr_detail.keys()) + list(lm_detail.keys()) + list(ly_detail.keys())))
                     detail_rows = []
                     for key in all_keys:
-                        curr_avg = curr_detail.get(key, 0)
-                        ly_avg = ly_detail.get(key, None)
-                        lm_avg = lm_detail.get(key, None)
-                        row = [key, f"¥{curr_avg:,.2f}"]
-                        if ly_avg is not None:
+                        cov_n = curr_cover_cnt.get(key, 0)
+                        # 单一口径：均价 = 该子项金额 ÷ 真正发生这笔费用的选片订单数（费用已发生的单）
+                        curr_avg = curr_cover_avg.get(key, 0.0)
+                        ly_avg = ly_cover_avg.get(key, None) if ly_cover_avg.get(key) else None
+                        lm_avg = lm_cover_avg.get(key, None) if lm_cover_avg.get(key) else None
+                        row = [key,
+                               (f"{cov_n:,}" if cov_n else "0"),
+                               (f"¥{curr_avg:,.2f}" if cov_n else "—")]
+                        if ly_avg:
                             diff_ly = curr_avg - ly_avg
-                            pct_ly = diff_ly / ly_avg * 100 if ly_avg else 0
+                            pct_ly = diff_ly / ly_avg * 100
                             row.extend([f"¥{ly_avg:,.2f}", f"{diff_ly:+,.2f}", f"{pct_ly:+.1f}%"])
                         else:
                             row.extend(["无数据", "—", "—"])
-                        if lm_avg is not None:
+                        if lm_avg:
                             diff_lm = curr_avg - lm_avg
-                            pct_lm = diff_lm / lm_avg * 100 if lm_avg else 0
+                            pct_lm = diff_lm / lm_avg * 100
                             row.extend([f"¥{lm_avg:,.2f}", f"{diff_lm:+,.2f}", f"{pct_lm:+.1f}%"])
                         else:
                             row.extend(["无数据", "—", "—"])
                         detail_rows.append(row)
 
-                    total_row = ['📌 拍摄费用均价', f"¥{curr_shoot_avg:,.2f}"]
+                    # 合计行与各子项同一分母定义：÷ 真正有拍摄费用的订单数
+                    total_row = ['📌 拍摄费用均价（有拍摄费用的单）',
+                                 (f"{curr_cov_orders:,}" if curr_cov_orders else "0"),
+                                 (f"¥{curr_shoot_avg:,.2f}" if curr_cov_orders else "—")]
                     if ly_shoot_avg is not None:
                         diff_total_ly = curr_shoot_avg - ly_shoot_avg
                         pct_total_ly = diff_total_ly / ly_shoot_avg * 100 if ly_shoot_avg else 0
@@ -2758,7 +2772,8 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                         total_row.extend(["无数据", "—", "—"])
                     detail_rows.append(total_row)
 
-                    detail_cols = ['明细项目', '本期均价', '去年同期均价', '同比差异', '同比变化',
+                    detail_cols = ['明细项目', '发生订单数', '本期均价',
+                                   '去年同期均价', '同比差异', '同比变化',
                                    '上月均价', '环比差异', '环比变化']
                     detail_df = pd.DataFrame(detail_rows, columns=detail_cols)
                     if not can_see:
@@ -3283,7 +3298,8 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
         avg_columns.append('环比原因')
     avg_table_html = df_to_html_rows(avg_df, avg_columns)
 
-    shoot_columns = ['明细项目', '本期均价', '去年同期均价', '同比差异', '同比变化']
+    shoot_columns = ['明细项目', '发生订单数', '本期均价']
+    shoot_columns += ['去年同期均价', '同比差异', '同比变化']
     if last_month_start and last_month_end:
         shoot_columns += ['上月均价', '环比差异', '环比变化']
     shoot_table_html = df_to_html_rows(detail_df, shoot_columns)
