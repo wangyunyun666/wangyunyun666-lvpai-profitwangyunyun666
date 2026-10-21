@@ -711,7 +711,9 @@ def _view_one(k, s, mm, span, biz, pl, yl, has_prev, has_yoy, extra=None):
     # ===== 四、成本结构
     fee_rows = []
     for disp, cat, v in cur['fees']:
-        if v <= 0:
+        # 只跳过「没有发生额」的科目（<0.5 元视为 0）；
+        # 负数（结息等收入冲减，如税费及手续费净额为负）要照常显示，否则表里少一行、对账也对不上
+        if abs(v) < 0.00005:
             continue
         kind2 = 'd' if cat == 'D' else 'i'
         pv = None
