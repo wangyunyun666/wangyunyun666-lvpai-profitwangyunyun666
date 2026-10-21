@@ -256,6 +256,54 @@ def _delta(cur, base, kind='money'):
     return f"<td class='dl {c}'>{ar} {pct:+.1f}%</td>"
 
 
+def _why_txt(disp, v, pv, qc, qp, cat):
+    """生成成本项「环比原因」注释：把金额环比拆成 单量 × 单均 两个效应。
+
+    - 直接成本(D)：金额 ≈ 单量 × 单均，拆开后指出主因/次因；
+    - 间接成本(I)：按月期间费用，总额不随单量，只提示摊薄效应；
+    - 上期无发生额 / 本期无发生额 单独说明。
+    纯文字说明，不参与任何数字计算，改错也不影响报表数值。
+    """
+    try:
+        if pv is None or float(pv) <= 0:
+            return "上期无发生额（新增科目或上月未录入）"
+        if v is None or float(v) <= 0:
+            return "本期无发生额"
+        v, pv = float(v), float(pv)
+        tot = v / pv - 1.0
+        if abs(tot) < 0.0005:
+            return "与上月基本持平"
+        qc = float(qc or 0)
+        qp = float(qp or 0)
+        has_q = qc > 0 and qp > 0
+        if cat == 'I':
+            if has_q:
+                qa, qb = v / qc, pv / qp
+                dq = qc / qp - 1.0
+                if abs(dq) < 0.005:
+                    return f"期间费用（不随单量），总额 {tot:+.1%}；单量基本持平"
+                return (f"期间费用（不随单量），总额 {tot:+.1%}；"
+                        f"单量 {dq:+.1%} → 单均摊 {_y(qb)}→{_y(qa)} 元/单")
+            return f"期间费用（不随单量），总额 {tot:+.1%}"
+        if not has_q:
+            return f"总额 {tot:+.1%}（无单量基数可拆）"
+        qa, qb = v / qc, pv / qp
+        dq, da = qc / qp - 1.0, qa / qb - 1.0
+        if abs(dq) < 0.005 and abs(da) < 0.005:
+            return "单量与单均基本持平"
+        if abs(da) < 0.005:
+            return f"主因单量 {dq:+.1%}（{_q(qp)}→{_q(qc)} 单），单均基本持平"
+        if abs(dq) < 0.005:
+            return f"主因单均 {da:+.1%}（{_y(qb)}→{_y(qa)} 元/单），单量基本持平"
+        if abs(dq) >= abs(da):
+            return (f"主因单量 {dq:+.1%}（{_q(qp)}→{_q(qc)} 单）；"
+                    f"次因单均 {da:+.1%}（{_y(qb)}→{_y(qa)} 元/单）")
+        return (f"主因单均 {da:+.1%}（{_y(qb)}→{_y(qa)} 元/单）；"
+                f"次因单量 {dq:+.1%}（{_q(qp)}→{_q(qc)} 单）")
+    except Exception:
+        return "—"
+
+
 def _dcell_money(cur, base, kind='money'):
     """给「金额/单价」行用：同时给出基准数与变化率两列。"""
     if base is None:
@@ -662,11 +710,15 @@ def _view_one(k, s, mm, span, biz, pl, yl, has_prev, has_yoy, extra=None):
                     pv = v2
                     break
         src = FEE_SRC.get(disp, '—')
+        why = ''
+        if show_prev:
+            why = _why_txt(disp, v, pv, cur.get('单数'), prev.get('单数') if prev else None, cat)
         fee_rows.append((v,
                          f"<tr><td class='l'>{_e(disp)}</td>"
                          f"<td class='c'>{_tag(CAT_TXT[cat], kind2)}</td>"
                          f"<td>{_w(v)}</td><td class='pc'>{_p(v, inc)}</td>"
                          + (_delta(v, pv, 'money') if show_prev else '')
+                         + (f"<td class='src'>{_e(why)}</td>" if show_prev else '')
                          + f"<td class='src'>{_e(src)}</td>"
                          + "</tr>"))
     fee_rows.sort(key=lambda t: -t[0])
@@ -676,13 +728,22 @@ def _view_one(k, s, mm, span, biz, pl, yl, has_prev, has_yoy, extra=None):
           "<th class='l'>费用项</th><th class='c' style='width:88px'>类别</th>"
           "<th style='width:110px'>金额(万)</th><th class='pc' style='width:90px'>占收入</th>"
           + (f"<th style='width:110px'>环比 {_e(pl)}</th>" if show_prev else "")
+          + ("<th class='l' style='width:270px'>环比原因</th>" if show_prev else "")
           + "<th class='l' style='width:300px'>数据来源</th>"
           + "</tr></thead><tbody>" + ''.join(h for _, h in fee_rows)
           + f"<tr class='tot'><td class='l'>成本合计</td><td class='c'>—</td>"
             f"<td>{_w(cost_all)}</td><td class='pc'>{_p(cost_all, inc)}</td>"
           + (_delta(cost_all, prev['总成本'] if prev else None, 'money') if show_prev else '')
+          + ("<td class='src'>" + _e(_why_txt('成本合计', cost_all,
+                                              prev['总成本'] if prev else None,
+                                              cur.get('单数'), prev.get('单数') if prev else None,
+                                              'D')) + "</td>" if show_prev else '')
           + "<td class='src'>以上各项实际发生额之和，与利润表「成本合计」一致。</td>"
-          + "</tr></tbody></table></div>")
+          + "</tr></tbody></table></div>"
+          + ("<div style='padding:6px 2px;color:#64748b;font-size:12px'>"
+             "💡 环比原因按「单量 × 单均」拆分：单均 = 该费用项金额 ÷ 本表订单数；"
+             "间接成本为按月期间费用，总额不随单量变化，单均只反映摊薄效应。</div>"
+             if show_prev else ""))
 
     # ===== 五+、系统分析块（价盘均价 / 拍摄费用 / 人工部门）
     extras = _extra_html(extra)
@@ -884,13 +945,15 @@ def _tips(cur, prev, yoy, mm, idx, name, inc, prof, rate, span, pl, yl, has_prev
             f"（真实亏损，建议核对成本并评估是否继续售卖）；"
             f"<b>{len(sens)}</b> 个仅在本口径亏损（对人工与推广分摊敏感，可优先调价或控投放）。")
         if wa < 0:
-            _tip_worst = (f"<b>最需关注</b>：<b>{_e(wn)}</b> 净亏 <b>{_w(abs(wa))} 万元</b>，为亏损最大套系；")
+            # 只有真亏损才点名「最需关注」；无亏损时不把利润最低的盈利套系拿出来示众
+            # （例如只有 1 单但单均利润很高的套系，点它反而误导）
+            tips.append(
+                f"<b>最需关注</b>：<b>{_e(wn)}</b> 净亏 <b>{_w(abs(wa))} 万元</b>，为亏损最大套系；"
+                f"<b>{_e(bn)}</b> 净赚 <b>{_w(ba)} 万元</b>，为利润最大贡献套系。")
         else:
-            _tip_worst = (f"<b>最需关注</b>：<b>{_e(wn)}</b> 净利 <b>{_w(wa)} 万元</b>，"
-                          f"为{name.replace('口径', '')}利润最低的套系（该口径下无亏损套系，不存在亏损）；")
-        tips.append(
-            _tip_worst +
-            f"<b>{_e(bn)}</b> 净赚 <b>{_w(ba)} 万元</b>，为利润最大贡献套系。")
+            tips.append(
+                f"<b>利润最大贡献</b>：<b>{_e(bn)}</b> 净赚 <b>{_w(ba)} 万元</b>，为利润最大贡献套系"
+                f"（该{name.replace('口径', '')}下全部套系盈利，无需重点关注亏损）。")
 
     pro, sal = cur['推广'], cur['人工']
     tips.append(

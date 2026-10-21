@@ -1852,6 +1852,33 @@ def _yoy_pack_from_df(df):
     return pack
 
 
+def _why_ratio_txt(num_ratio, den_ratio, num_cur, num_prev, den_cur, den_prev, den_name='单量'):
+    """把「均价/单均」的环比拆成 分子(费用总额) × 分母(除数) 两个效应，返回一句原因说明。
+
+    纯文字注释，不参与任何数字计算。num_* 为分子（费用总额）环比与金额，
+    den_* 为分母（除数/单量）环比与数值。
+    """
+    try:
+        if abs(den_ratio) < 0.005 and abs(num_ratio) < 0.005:
+            return "总额与除数基本持平"
+        parts = []
+        num_seg = f"费用总额 {num_ratio:+.1%}" + (f"（¥{num_prev:,.0f}→¥{num_cur:,.0f}）" if num_prev else "")
+        den_seg = f"{den_name} {den_ratio:+.1%}（{den_prev:,.0f}→{den_cur:,.0f}）"
+        if abs(num_ratio) >= abs(den_ratio):
+            if abs(num_ratio) >= 0.005:
+                parts.append("主因" + num_seg)
+            if abs(den_ratio) >= 0.005:
+                parts.append("次因" + den_seg)
+        else:
+            if abs(den_ratio) >= 0.005:
+                parts.append("主因" + den_seg)
+            if abs(num_ratio) >= 0.005:
+                parts.append("次因" + num_seg)
+        return "；".join(parts) if parts else "总额与除数基本持平"
+    except Exception:
+        return "—"
+
+
 def _extra_rows(df, columns, title):
     """把分析用 DataFrame 转成汇报模板的「附录表」结构 (标题, 表头, 行)。"""
     if df is None or len(df) == 0:
@@ -2408,6 +2435,7 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                     # 上月同期（环比）
                     lm_avgs = {}
                     lm_divisor_info = {}
+                    lm_divisor_val = {}   # 上月各费用项除数（原始数值，用于环比原因拆分）
                     lm_erxiao_cnt = 0.0
                     lm_wedding_cnt = 0.0
                     lm_area_cnt = 0.0
@@ -2500,6 +2528,7 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                 divisor_label = f"{div_name}: {_fmt_div(divisor)}"
                                 lm_avgs[item] = total_lm / divisor if divisor else 0
                                 lm_divisor_info[item] = divisor_label
+                                lm_divisor_val[item] = divisor
 
                     final_rows = []
                     for idx_row, (item, div_type, div_name) in enumerate(avg_config):
@@ -2530,11 +2559,25 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                 row.extend([f"¥{lm_avg:,.2f}", f"{lm_div_label}", f"{diff_m:+,.2f}", f"{pct_m:+.1f}%"])
                             else:
                                 row.extend(["无数据", "—", "—", "—"])
+                            # 环比原因：把均价环比拆成 费用总额(分子) × 除数(分母)
+                            if lm_avg is not None and lm_avg > 0 and divisor_val:
+                                lm_div_v = lm_divisor_val.get(item, 0)
+                                if lm_div_v:
+                                    num_ratio = (curr_avg * divisor_val) / (lm_avg * lm_div_v) - 1.0
+                                    den_ratio = divisor_val / lm_div_v - 1.0
+                                    row.append(_why_ratio_txt(num_ratio, den_ratio,
+                                                              curr_avg * divisor_val, lm_avg * lm_div_v,
+                                                              divisor_val, lm_div_v,
+                                                              div_name if div_name else '除数'))
+                                else:
+                                    row.append("上月除数为 0，无法拆分原因")
+                            else:
+                                row.append("上月无该项费用，无环比")
                         final_rows.append(row)
 
                     cols = ['费用项', '本期均价', '除数', '去年同期均价', '同比差异', '同比变化']
                     if last_month_start and last_month_end:
-                        cols += ['上月均价', '上月除数', '环比差异', '环比变化']
+                        cols += ['上月均价', '上月除数', '环比差异', '环比变化', '环比原因']
                     df_avg = pd.DataFrame(final_rows, columns=cols)
                     if not can_see:
                         df_avg = mask_dataframe(df_avg)
@@ -2844,10 +2887,26 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                 row.extend([f"¥{lm_avg:,.2f}", f"{diff_lm:+,.2f}", f"{pct_lm:+.1f}%"])
                             else:
                                 row.extend(["无数据", "—", "—"])
+                            # 环比原因：部门均价环比 = 部门工资总额(分子) × 单量(分母)
+                            try:
+                                cur_div_s = order_cnt if promo_mode == 'allocation' else total_orders
+                                lm_div_s = lm_order_cnt if promo_mode == 'allocation' else lm_total_orders
+                            except Exception:
+                                cur_div_s, lm_div_s = 0, 0
+                            if lm_avg is not None and lm_avg > 0 and curr_avg > 0 and cur_div_s and lm_div_s:
+                                num_ratio_s = (curr_avg * cur_div_s) / (lm_avg * lm_div_s) - 1.0
+                                den_ratio_s = cur_div_s / lm_div_s - 1.0
+                                row.append(_why_ratio_txt(num_ratio_s, den_ratio_s,
+                                                          curr_avg * cur_div_s, lm_avg * lm_div_s,
+                                                          cur_div_s, lm_div_s, '单量'))
+                            elif lm_avg is not None:
+                                row.append("上月除数缺失，无法拆分原因")
+                            else:
+                                row.append("上月无该项工资，无环比")
                             rows.append(row)
 
                         labor_cols = ['部门', '本期均价', '去年同期均价', '同比差异', '同比变化',
-                                      '上月均价', '环比差异', '环比变化']
+                                      '上月均价', '环比差异', '环比变化', '环比原因']
                         salary_df = pd.DataFrame(rows, columns=labor_cols)
                         if not can_see:
                             salary_df = mask_dataframe(salary_df)
@@ -3220,6 +3279,8 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
     avg_columns = ['费用项', '本期均价', '除数', '去年同期均价', '同比差异', '同比变化']
     if last_month_start and last_month_end:
         avg_columns += ['上月均价', '上月除数', '环比差异', '环比变化']
+    if '环比原因' in avg_df.columns:
+        avg_columns.append('环比原因')
     avg_table_html = df_to_html_rows(avg_df, avg_columns)
 
     shoot_columns = ['明细项目', '本期均价', '去年同期均价', '同比差异', '同比变化']
@@ -3230,6 +3291,8 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
     labor_columns = ['部门', '本期均价', '去年同期均价', '同比差异', '同比变化']
     if last_month_start and last_month_end:
         labor_columns += ['上月均价', '环比差异', '环比变化']
+    if '环比原因' in salary_df.columns:
+        labor_columns.append('环比原因')
     labor_table_html = df_to_html_rows(salary_df, labor_columns)
 
     # ==================== 交互式 Plotly 图表（HTML + CDN，无需服务器安装字体） ====================
