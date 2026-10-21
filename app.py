@@ -14,7 +14,7 @@ from profit_engine import generate_profit_report, generate_profit_report_multi_m
 import streamlit.components.v1 as components
 from dual_report_v3 import render as render_brief_report
 import hist_yoy
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from werkzeug.security import generate_password_hash, check_password_hash
 import re
 import calendar
@@ -1857,13 +1857,16 @@ def _why_ratio_txt(num_ratio, den_ratio, num_cur, num_prev, den_cur, den_prev, d
 
     纯文字注释，不参与任何数字计算。num_* 为分子（费用总额）环比与金额，
     den_* 为分母（除数/单量）环比与数值。
+    注意：文字必须短 —— 这列会进页面表格和导出 HTML，带上「（¥a→¥b）」
+    明细会把整张表撑出屏幕（2026-10-21 用户实测截断）。金额本身就在
+    「本期均价 / 上月均价」等相邻列里，这里不重复。
     """
     try:
         if abs(den_ratio) < 0.005 and abs(num_ratio) < 0.005:
             return "总额与除数基本持平"
         parts = []
-        num_seg = f"费用总额 {num_ratio:+.1%}" + (f"（¥{num_prev:,.0f}→¥{num_cur:,.0f}）" if num_prev else "")
-        den_seg = f"{den_name} {den_ratio:+.1%}（{den_prev:,.0f}→{den_cur:,.0f}）"
+        num_seg = f"费用总额 {num_ratio:+.1%}"
+        den_seg = f"{den_name} {den_ratio:+.1%}"
         if abs(num_ratio) >= abs(den_ratio):
             if abs(num_ratio) >= 0.005:
                 parts.append("主因" + num_seg)
@@ -2225,6 +2228,51 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
         # 格式化：None → 短横 —
         for _col in ['本月转化率', '上月转化率', '上年同期转化率']:
             conv_df[_col] = conv_df[_col].apply(lambda r: f"{r:.1%}" if r is not None else "—")
+
+        # ---------- 汇报用转化率表（含毛客数 / 成交单数 / 百分点变化） ----------
+        # 转化率本身是百分比，变化用「个百分点(pp)」表达更直观：
+        # 10.6% → 11.2% 说「+0.60 pp」，而不是容易误读的「+5.7%」。
+        def _pp(cur_r, base_r):
+            if cur_r is None or base_r is None:
+                return "—"
+            d = (cur_r - base_r) * 100
+            return "0.00 pp" if abs(d) < 0.005 else f"{d:+.2f} pp"
+
+        _conv_rows = []
+        for bt in _CONV_BIZ_TYPES:
+            _gl, _oc = _conv_raw['cur'].get(bt, (0, 0))
+            _glp, _ocp = _conv_raw['last'].get(bt, (0, 0))
+            _gll, _ocl = _conv_raw['ly'].get(bt, (0, 0))
+            if not (_gl or _oc or _glp or _gll):
+                continue          # 该业务类型三期都没数据，不占一行
+            _rc = _safe_rate(_gl, _oc)
+            _rp = _safe_rate(_glp, _ocp)
+            _rl = _safe_rate(_gll, _ocl)
+            _conv_rows.append([
+                bt, f"{_gl:,.0f}", f"{_oc:,.0f}",
+                (f"{_rc:.1%}" if _rc is not None else "—"),
+                (f"{_rp:.1%}" if _rp is not None else "—"), _pp(_rc, _rp),
+                (f"{_rl:.1%}" if _rl is not None else "—"), _pp(_rc, _rl),
+            ])
+        # 合计行：转化率必须「总成交 ÷ 总毛客」，不能把各业务线转化率取平均
+        _tg = sum(v[0] for v in _conv_raw['cur'].values())
+        _to = sum(v[1] for v in _conv_raw['cur'].values())
+        _tgp = sum(v[0] for v in _conv_raw['last'].values())
+        _top = sum(v[1] for v in _conv_raw['last'].values())
+        _tgl = sum(v[0] for v in _conv_raw['ly'].values())
+        _tol = sum(v[1] for v in _conv_raw['ly'].values())
+        if _conv_rows and (_tg or _to):
+            _tc, _tp, _tl = _safe_rate(_tg, _to), _safe_rate(_tgp, _top), _safe_rate(_tgl, _tol)
+            _conv_rows.append([
+                '合计', f"{_tg:,.0f}", f"{_to:,.0f}",
+                (f"{_tc:.1%}" if _tc is not None else "—"),
+                (f"{_tp:.1%}" if _tp is not None else "—"), _pp(_tc, _tp),
+                (f"{_tl:.1%}" if _tl is not None else "—"), _pp(_tc, _tl),
+            ])
+        conv_tbl = ('📉 转化率（成交订单数 ÷ 毛客数）',
+                    ['业务类型', '毛客数', '成交单数', '本期转化率',
+                     '上月转化率', '环比', '去年同期转化率', '同比'],
+                    _conv_rows) if _conv_rows else None
 
         db.close()
 
@@ -3486,12 +3534,64 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
     # ---- 附录：把系统已算好的三个分析块（费用明细 / 人工部门 / 均价）转成汇报的附表
     # 两个口径各生成一套：当前口径用本次页面算好的；另一口径用会话里缓存的那套。
     # 两边都齐 → 一个文件带齐两套附表，不用再导第二份。
+    # ---- 附录：运营成本（business_type='运营'，账号存在 cost_item 字段，与口径无关）
+    # 运营成本是「按账号投放/运营」的期间费用，不进利润表的 13 项成本口径，
+    # 但老板看汇报时要能一眼看到总额与环比，所以单列一张附表。
+    def _ops_sum(_s, _e):
+        if not _s or not _e:
+            return {}
+        _ms = _period_months(_s, _e)
+        if not _ms:
+            return {}
+        _db = SessionLocal()
+        try:
+            _rows = (_db.query(IndirectCost.cost_item, func.sum(IndirectCost.amount))
+                        .filter(IndirectCost.business_type == '运营',
+                                IndirectCost.period.in_(_ms))
+                        .group_by(IndirectCost.cost_item).all())
+            return {(k or '（未命名账号）'): float(v or 0) for k, v in _rows}
+        except Exception:
+            return {}
+        finally:
+            _db.close()
+
+    def _fy(v):
+        return f"¥{v:,.0f}" if v else "—"
+
+    def _dchg(cur_v, base_v):
+        if not base_v:
+            return "—"
+        d = cur_v - base_v
+        return f"{d:+,.0f}（{d / base_v:+.1%}）"
+
+    _ops_cur = _ops_sum(period_start, period_end)
+    _ops_prev = _ops_sum(_lms, _lme)
+    _ops_ly = _ops_sum(_lys, _lye)
+    ops_tbl = None
+    if _ops_cur or _ops_prev or _ops_ly:
+        _ops_keys = sorted(set(_ops_cur) | set(_ops_prev) | set(_ops_ly),
+                           key=lambda k: -_ops_cur.get(k, 0.0))
+        _orows = [[_k,
+                   _fy(_ops_cur.get(_k, 0.0)), _fy(_ops_prev.get(_k, 0.0)),
+                   _dchg(_ops_cur.get(_k, 0.0), _ops_prev.get(_k, 0.0)),
+                   _fy(_ops_ly.get(_k, 0.0)),
+                   _dchg(_ops_cur.get(_k, 0.0), _ops_ly.get(_k, 0.0))]
+                  for _k in _ops_keys]
+        _o_c, _o_p, _o_l = sum(_ops_cur.values()), sum(_ops_prev.values()), sum(_ops_ly.values())
+        _orows.append(['合计', _fy(_o_c), _fy(_o_p), _dchg(_o_c, _o_p),
+                       _fy(_o_l), _dchg(_o_c, _o_l)])
+        ops_tbl = ('🏢 运营成本（按账号，含环比同比）',
+                   ['账号', '本期', '上月', '环比', '去年同期', '同比'], _orows)
+
     def _build_extras(_avg, _detail, _salary):
         return [x for x in (
             _extra_rows(_detail, shoot_columns, '📸 拍摄费用明细分析（含同比）'),
             _extra_rows(_salary, labor_columns, '💼 人工成本分析（部门均价同比）'),
             _extra_rows(_avg, avg_columns, '📈 均价及同比环比分析'),
         ) if x]
+
+    # 转化率 / 运营成本与费用口径无关，两个视图都挂同一份
+    _shared_extras = [x for x in (conv_tbl, ops_tbl) if x]
 
     _ex_cur = _build_extras(avg_df, detail_df, salary_df)
     _ex_oth = _build_extras(avg_df_o, detail_df_o, salary_df_o)
@@ -3503,7 +3603,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                      f"再切回来导出，这一个文件里两个口径的附表就都齐了，无需再导第二份。", [])
 
     def _pick_extras(_own, _fallback_notice):
-        return _own if _own else [_fallback_notice]
+        # 注意：要按「分析表是否存在」判断，不能按整个 extra 列表是否为空判断
+        # —— 转化率 / 运营成本是常驻的，否则另一口径缺附表时的提示卡会被它们挤掉。
+        return (_own if _own else [_fallback_notice]) + _shared_extras
 
     if promo_mode == 'actual':
         _extra_map = {'a': _pick_extras(_ex_cur, _notice_other),
@@ -3920,8 +4022,16 @@ def import_operation_cost_page():
         if st.button("确认导入运营成本"):
             db = SessionLocal()
             try:
-                # 删除所有 business_type='运营' 的旧记录
-                db.query(IndirectCost).filter_by(business_type='运营').delete()
+                # ⚠️ 只清空「本次文件涉及的那几个月」，不能像旧代码那样
+                # `filter_by(business_type='运营').delete()` —— 那会把**其他所有月份**
+                # 的运营成本一并删掉，而页面说明写的是「重复导入同一个月会覆盖该月」，
+                # 行为与说明不符，且是静默丢数。
+                _periods_in_file = [p for p in pd.unique(records['年月']) if p]
+                if _periods_in_file:
+                    db.query(IndirectCost).filter(
+                        IndirectCost.business_type == '运营',
+                        IndirectCost.period.in_(list(_periods_in_file))
+                    ).delete(synchronize_session=False)
                 for _, row in records.iterrows():
                     db.add(IndirectCost(
     period=row['年月'],
@@ -4068,11 +4178,17 @@ def import_actual_cost_page():
         try:
             oids = list({r[0] for r in records})
             items = list({r[1] for r in records})
+            _overwritten = 0
             if oids and items:
+                # ⚠️ 只覆盖「同一订单同一费用项」的普通记录，且**不动「自租场地消耗」写进来的
+                # 场地记录**：那是另一笔独立成本（交付场地费 + 自租消耗），本页无差别删除
+                # 会把它一起抹掉，且这里没有「覆盖/合并」选项，用户完全无感。
                 existing_rows = db.query(ActualDirectCost).filter(
                     ActualDirectCost.order_id.in_(oids),
-                    ActualDirectCost.cost_item.in_(items)
+                    ActualDirectCost.cost_item.in_(items),
+                    or_(ActualDirectCost.remark.is_(None), ActualDirectCost.remark != '自租场地')
                 ).all()
+                _overwritten = len(existing_rows)
                 for row in existing_rows:
                     db.delete(row)
             for oid, item, amt in records:
@@ -4082,8 +4198,12 @@ def import_actual_cost_page():
                 if order: order.actual_retouch_fee = fee
                 else: db.add(Order(order_id=oid, actual_retouch_fee=fee))
             db.commit()
-            msg = f"成功导入/更新 {len(records)} 条成本记录，修片费更新 {len(retouch_updates)} 个订单" if can_see else "成功导入/更新 *** 条成本记录，修片费更新 *** 个订单"
+            msg = (f"成功导入/更新 {len(records)} 条成本记录（覆盖原有 {_overwritten} 条），"
+                   f"修片费更新 {len(retouch_updates)} 个订单") if can_see else \
+                "成功导入/更新 *** 条成本记录，修片费更新 *** 个订单"
             st.success(msg)
+            if can_see and _overwritten:
+                st.caption("说明：被覆盖的只是同订单同费用项的旧记录；「🏟️ 自租场地消耗」导入的场地记录不受影响。")
             add_log(st.session_state.user_id, st.session_state.username, "导入实际成本", f"成本{len(records)}条" if can_see else "成本***条")
             try:
                 from profit_engine import clear_profit_cache
@@ -4706,9 +4826,11 @@ def order_query_page():
             for ac in actual_costs:
                     if ac.order_id not in act_dict:
                         act_dict[ac.order_id] = {}
-                    # 同一订单同一费用项取最大值，避免0覆盖非0
+                    # 同一订单同一费用项可能有多条记录（例：交付场地费 + 自租场地消耗并存，
+                    # 或旧版重复导入留下的多行）。报表引擎是 pivot_table(sum) 求和，
+                    # 这里必须同样求和 —— 旧写法取 max，会让本页的场地费比报表少一截。
                     old_val = act_dict[ac.order_id].get(ac.cost_item, 0)
-                    act_dict[ac.order_id][ac.cost_item] = max(old_val or 0, ac.amount or 0)
+                    act_dict[ac.order_id][ac.cost_item] = (old_val or 0) + (ac.amount or 0)
                     actual_existing.add((ac.order_id, ac.cost_item))
             latest_batch = db.query(
                 CherryProductCost.batch_id,
@@ -5265,7 +5387,10 @@ def delivery_cost_import_page():
             items = list({r[1] for r in records})
             existing = db.query(ActualDirectCost).filter(
                 ActualDirectCost.order_id.in_(oids),
-                ActualDirectCost.cost_item.in_(items)
+                ActualDirectCost.cost_item.in_(items),
+                # 排除「自租场地消耗」页写入的 场地 记录：那是另一笔独立成本，
+                # 若当作重复记录被本页「覆盖」删掉，自租消耗的钱就凭空消失了。
+                or_(ActualDirectCost.remark.is_(None), ActualDirectCost.remark != '自租场地')
             ).all()
             existing_map = {(e.order_id, e.cost_item): e.amount for e in existing}
             duplicates_info = [(r[0], r[1], existing_map.get((r[0], r[1]), 0), r[2]) for r in records if (r[0], r[1]) in existing_map]
@@ -5286,18 +5411,28 @@ def delivery_cost_import_page():
             db = SessionLocal()
             try:
                 dup_keys = {(d[0], d[1]) for d in duplicates_info}
+                _not_self_rent = or_(ActualDirectCost.remark.is_(None),
+                                     ActualDirectCost.remark != '自租场地')
 
                 if handle_dup == "覆盖已有记录":
                     for (oid, item) in dup_keys:
-                        db.query(ActualDirectCost).filter_by(order_id=oid, cost_item=item).delete()
+                        db.query(ActualDirectCost).filter(
+                            ActualDirectCost.order_id == oid,
+                            ActualDirectCost.cost_item == item,
+                            _not_self_rent
+                        ).delete(synchronize_session=False)
                     db.commit()
                     for oid, item, amt, remark in records:
                         db.add(ActualDirectCost(order_id=oid, cost_item=item, amount=amt, remark=remark))
 
                 elif handle_dup == "合并金额（新旧相加）":
                     for (oid, item, old_amt, new_amt) in duplicates_info:
-                        db.query(ActualDirectCost).filter_by(order_id=oid, cost_item=item).delete()
-                        merged = old_amt + new_amt
+                        db.query(ActualDirectCost).filter(
+                            ActualDirectCost.order_id == oid,
+                            ActualDirectCost.cost_item == item,
+                            _not_self_rent
+                        ).delete(synchronize_session=False)
+                        merged = (old_amt or 0) + new_amt
                         remark = next((r[3] for r in records if r[0] == oid and r[1] == item), "")
                         db.add(ActualDirectCost(order_id=oid, cost_item=item, amount=merged, remark=remark))
                     for oid, item, amt, remark in records:
@@ -5332,8 +5467,9 @@ def venue_self_rent_import_page():
     st.markdown("""
     **说明**：  
     - 上传 Excel 文件，需包含列：`订单号`、`成本`。  
-    - 导入「场地」实际直接成本，与交付费用中的场地费合并。  
-    - 重复处理：覆盖 / 仅导入新记录 / 合并金额。
+    - 导入「场地」实际直接成本，与交付费用中的场地费**相加**（互不覆盖）。
+    - 重复处理：覆盖 / 仅导入新记录 / 合并金额（只作用于本页导入的自租记录）。
+    - 上传后页面会先做**导入前自检**：告诉你这批钱会落到哪个月、有没有订单号对不上。
     """)
     uploaded = st.file_uploader("上传自租场地消耗Excel", type=["xlsx", "xls"])
     if uploaded:
@@ -5353,7 +5489,11 @@ def venue_self_rent_import_page():
         df = df.rename(columns={oid_col: '订单号', cost_col: '成本'})
         df['成本'] = pd.to_numeric(df['成本'], errors='coerce').fillna(0)
         df = df.dropna(subset=['订单号', '成本'])
-        df['订单号'] = df['订单号'].astype(str).str.strip()
+        # 订单号归一：Excel 常把纯数字订单号存成 2609010001.0 / 2.60901e+09，
+        # 直接 astype(str) 会得到 "2609010001.0"，与库里的 "2609010001" 对不上，
+        # 引擎按 order_id 精确关联时这批钱就永远不会进报表（历史上很难察觉）。
+        df['订单号'] = (df['订单号'].astype(str).str.strip()
+                        .str.replace(r'\.0$', '', regex=True))
         df = df[~df['订单号'].isin(['', 'nan', 'None', 'NaN'])]
         records = [(row['订单号'], float(row['成本'])) for _, row in df.iterrows()]
         if not records:
@@ -5361,12 +5501,61 @@ def venue_self_rent_import_page():
             return
         st.info(f"共解析 {len(records)} 条记录" if can_see else "共解析 *** 条记录")
 
+        # ---------- 导入前自检：这批数据到底会不会进报表 ----------
+        # 两个静默失败点：①订单号在订单表里查不到（金额进了库但引擎关联不上）
+        # ②订单号查得到，但选片日期不在你要看的那个月（报表按月归到别的月份去了）
+        _ids = [r[0] for r in records]
+        _chk = SessionLocal()
+        try:
+            _rows = _chk.query(Order.order_id, Order.selection_date).filter(
+                Order.order_id.in_(_ids)
+            ).all()
+        finally:
+            _chk.close()
+        _sel = {o[0]: o[1] for o in _rows}
+        _miss = [i for i in _ids if i not in _sel]
+        _by_month = {}
+        for _oid, _amt in records:
+            if _oid in _sel:
+                _sd = _sel[_oid]
+                _k = f"{_sd.year}年{_sd.month}月" if _sd else "无选片日期"
+                _a, _c = _by_month.get(_k, (0.0, 0))
+                _by_month[_k] = (_a + _amt, _c + 1)
+        if can_see:
+            st.markdown("**🔍 导入前自检**")
+            st.caption(f"本次解析 **{len(records)}** 条，金额合计 **¥{sum(r[1] for r in records):,.2f}**")
+            if _by_month:
+                _lines = "；".join(f"{k} **{c}** 条 ¥{a:,.0f}"
+                                   for k, (a, c) in sorted(_by_month.items(), reverse=True))
+                st.caption(f"按这些订单的**选片日期**分布：{_lines}")
+                st.caption("报表是按选片日期归月的 —— 只有选片日期落在该月的订单，金额才会出现在那个月的报表里。")
+            if _miss:
+                st.warning(
+                    f"⚠️ 有 **{len(_miss)}** 条订单号在系统订单表里**查不到**，这些费用不会出现在任何报表里：\n\n"
+                    f"{'、'.join(_miss[:5])}{' …' if len(_miss) > 5 else ''}\n\n"
+                    "常见原因：订单号前后有空格、被存成了数字（带 .0 或科学计数）、或该订单还没导入系统。\n\n"
+                    f"**已自动跳过这 {len(_miss)} 条**，只导入能匹配到订单的 {len(records) - len(_miss)} 条；"
+                    "补齐订单后再上传一次即可。"
+                )
+        else:
+            st.caption(f"自检：订单表可匹配 {len(_sel)} 条，未匹配 {len(_miss)} 条（金额已隐藏）")
+
+        _skipped = len(_miss)
+        if _skipped:
+            records = [r for r in records if r[0] in _sel]
+            if not records:
+                st.error("全部记录的订单号都查不到，已停止导入。请先核对订单号或先导入订单。")
+                return
+
         db = SessionLocal()
         try:
             oids = [r[0] for r in records]
             existing = db.query(ActualDirectCost).filter(
                 ActualDirectCost.order_id.in_(oids),
-                ActualDirectCost.cost_item == '场地'
+                ActualDirectCost.cost_item == '场地',
+                # 只把「自租场地」自己的记录算作重复：
+                # 交付费用导入的场地费（remark 为「日期:…」或空串）是另一笔成本，不能当成重复记录覆盖掉。
+                or_(ActualDirectCost.remark == '自租场地', ActualDirectCost.remark.is_(None))
             ).all()
             existing_map = {e.order_id: e.amount for e in existing}
             duplicates_info = [(oid, existing_map.get(oid, 0), amt) for oid, amt in records if oid in existing_map]
@@ -5387,18 +5576,28 @@ def venue_self_rent_import_page():
             db = SessionLocal()
             try:
                 dup_oids = {d[0] for d in duplicates_info}
+                _venue_self = or_(ActualDirectCost.remark == '自租场地', ActualDirectCost.remark.is_(None))
 
                 if handle_dup == "覆盖已有记录":
                     for oid in dup_oids:
-                        db.query(ActualDirectCost).filter_by(order_id=oid, cost_item='场地').delete()
+                        db.query(ActualDirectCost).filter(
+                            ActualDirectCost.order_id == oid,
+                            ActualDirectCost.cost_item == '场地',
+                            _venue_self
+                        ).delete(synchronize_session=False)
                     db.commit()
                     for oid, amt in records:
                         db.add(ActualDirectCost(order_id=oid, cost_item='场地', amount=amt, remark='自租场地'))
 
                 elif handle_dup == "合并金额（新旧相加）":
                     for oid, old_amt, new_amt in duplicates_info:
-                        db.query(ActualDirectCost).filter_by(order_id=oid, cost_item='场地').delete()
-                        db.add(ActualDirectCost(order_id=oid, cost_item='场地', amount=old_amt + new_amt, remark='自租场地'))
+                        db.query(ActualDirectCost).filter(
+                            ActualDirectCost.order_id == oid,
+                            ActualDirectCost.cost_item == '场地',
+                            _venue_self
+                        ).delete(synchronize_session=False)
+                        db.add(ActualDirectCost(order_id=oid, cost_item='场地',
+                                                amount=(old_amt or 0) + new_amt, remark='自租场地'))
                     for oid, amt in records:
                         if oid in dup_oids:
                             continue
@@ -5411,7 +5610,12 @@ def venue_self_rent_import_page():
                         db.add(ActualDirectCost(order_id=oid, cost_item='场地', amount=amt, remark='自租场地'))
 
                 db.commit()
-                st.success(f"成功导入 {len(records)} 条场地费用" if can_see else "成功导入 *** 条场地费用")
+                _skip_txt = f"（另有 {_skipped} 条订单号查不到，已跳过）" if _skipped else ""
+                st.success((f"成功导入 {len(records)} 条场地费用{_skip_txt}") if can_see
+                           else "成功导入 *** 条场地费用")
+                if can_see:
+                    st.caption(f"本次写入金额合计 ¥{sum(r[1] for r in records):,.2f}。"
+                               "报表缓存已清空，请回到「📊 生成利润表」重新生成对应月份再看。")
                 add_log(st.session_state.user_id, st.session_state.username, "导入自租场地消耗", f"共{len(records)}条" if can_see else "共***条")
                 try:
                     from profit_engine import clear_profit_cache
