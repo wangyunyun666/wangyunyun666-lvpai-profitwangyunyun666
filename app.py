@@ -63,6 +63,18 @@ SET_TYPE_MAP = {
 SALARY_DEPTS = ['策划部', '销售部', '运营部', '综合部', '总经办', '售后服务',
                 'AI与数据中心', '视频剪辑部']
 
+# 运营成本账号别名：同一账号在账单里出现过不同写法 → 归并成右边的统一名称。
+# 汇报附表（🏢 运营成本）与「📋 运营成本查询」页都按此归并；再发现重复写法时加一行即可。
+OPS_ACCOUNT_ALIAS = {
+    'Dou+': '抖音：抖+消耗',
+}
+
+
+def _ops_account(name):
+    """运营成本账号名归一：去掉首尾空白后查别名表。"""
+    _k = (name or '').strip()
+    return OPS_ACCOUNT_ALIAS.get(_k, _k or '（未命名账号）')
+
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'user_id' not in st.session_state: st.session_state.user_id = None
 if 'username' not in st.session_state: st.session_state.username = None
@@ -3549,7 +3561,11 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                         .filter(IndirectCost.business_type == '运营',
                                 IndirectCost.period.in_(_ms))
                         .group_by(IndirectCost.cost_item).all())
-            return {(k or '（未命名账号）'): float(v or 0) for k, v in _rows}
+            _out = {}
+            for _k, _v in _rows:
+                _name = _ops_account(_k)          # 别名归并：同一账号不同写法相加
+                _out[_name] = _out.get(_name, 0.0) + float(_v or 0)
+            return _out
         except Exception:
             return {}
         finally:
@@ -4075,9 +4091,10 @@ def operation_cost_query_page():
         if records:
             df = pd.DataFrame([{
                 '年月': r.period,
-                '账号': r.cost_item,  # 注意：我们将账号存在 cost_item 字段
+                '账号': _ops_account(r.cost_item),  # 别名归并：同一账号不同写法统一显示
                 '金额': r.amount
             } for r in records])
+            df = df.groupby(['年月', '账号'], as_index=False)['金额'].sum()
             if can_see:
                 st.dataframe(df, width='stretch')
             else:
