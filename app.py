@@ -4353,6 +4353,11 @@ def indirect_cost_page():
                         db.commit()
                         msg = "工资批量导入成功！" if can_see else "工资批量导入成功（数量已隐藏）"
                         st.success(msg)
+                        try:
+                            from profit_engine import clear_profit_cache
+                            clear_profit_cache()
+                        except Exception:
+                            pass
                         st.rerun()
                     except Exception as e:
                         db.rollback(); st.error(f"导入失败：{e}")
@@ -4425,6 +4430,11 @@ def indirect_cost_page():
                                   "或改用「🏜️ 新疆拍样/报销费用」页导入。"
                             )
                         if not _rows_bad:
+                            try:
+                                from profit_engine import clear_profit_cache
+                                clear_profit_cache()
+                            except Exception:
+                                pass
                             st.rerun()
                     except Exception as e:
                         db.rollback(); st.error(f"导入失败：{e}")
