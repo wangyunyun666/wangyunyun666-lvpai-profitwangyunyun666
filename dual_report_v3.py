@@ -878,6 +878,11 @@ def _extra_html(extra):
         th = ''.join("<th class='%s'>%s</th>" % ('l' if i == 0 else '', _e(h))
                      for i, h in enumerate(headers))
         body = []
+        # 「环比原因」列文字很长：允许换行并限宽，否则 nowrap 会把表格撑出卡片被裁掉
+        try:
+            why_i = list(headers).index('环比原因')
+        except ValueError:
+            why_i = -1
         for r in rows:
             cells = [str(c) for c in list(r) + [''] * (n - len(r))][:n]
             first = cells[0].strip()
@@ -887,6 +892,9 @@ def _extra_html(extra):
                 c = c.replace('📌', '').strip()
                 if i == 0:
                     tds.append(f"<td class='l'>{_e(c)}</td>")
+                    continue
+                if i == why_i:
+                    tds.append(f"<td class='why'>{_e(c)}</td>")
                     continue
                 dc = _delta_cls(c) if i >= 3 else ''   # 前 3 列内数值不上色
                 if dc:
@@ -1158,6 +1166,8 @@ td.pc{color:#8296a8}
 td.base{color:#8296a8;background:#fcfdff}
 td.src{text-align:left;white-space:normal;font-size:11.5px;line-height:1.5;
 color:#7b8a9c;background:#fbfcfe;max-width:300px}
+td.why{text-align:left;white-space:normal;font-size:11.5px;line-height:1.55;
+color:#475669;max-width:300px;min-width:150px}
 td.na{color:#c2ccd8}
 tr:last-child td{border-bottom:0}
 tr.tot td{background:#fafbfd;font-weight:700;border-top:1px solid #e6ecf4}
