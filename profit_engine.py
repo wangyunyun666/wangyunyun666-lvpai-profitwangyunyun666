@@ -153,7 +153,7 @@ def generate_profit_report(period_start, period_end, promo_mode='actual'):
         travel_promo = 0.0
         wedding_promo = 0.0
 
-        salary_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资','售后服务工资','AI与数据中心工资','视频剪辑部工资']
+        salary_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资','售后服务工资','AI与数据中心工资']
         indirect_items = ['房租、水电、办公费等','税费及手续费','样片研发','场地铺设费','舆情处理']
 
         for inv in rows:
@@ -339,7 +339,9 @@ def generate_profit_report(period_start, period_end, promo_mode='actual'):
                 '套系金额': float(grp['set_price'].sum()),
                 '套系均价': float(grp['set_price'].sum() / qty) if qty else 0.0,
                 '二销金额': float(grp['second_sales'].sum()),
-                '二销均价': float(grp['second_sales'].sum() / qty) if qty else 0.0,
+                # 二销均价分母 = 有二销的订单数（second_sales>0），而非套系全部订单数（2026-11-24 修正）
+                '二销订单数': int((grp['second_sales'] > 0).sum()),
+                '二销均价': float(grp['second_sales'].sum() / (grp['second_sales'] > 0).sum()) if (grp['second_sales'] > 0).sum() else 0.0,
                 '客诉退款金额': float(grp['refund'].sum()),
                 '总收入': float(grp['set_price'].sum() + grp['second_sales'].sum() - grp['refund'].sum()),
             }
@@ -451,7 +453,7 @@ def generate_profit_report(period_start, period_end, promo_mode='actual'):
         report_df['利润率'] = report_df.apply(lambda r: r['利润合计'] / r['总收入'] if r['总收入'] else 0.0, axis=1)
 
         base_cols = ['业务类型', '套系', '套系单价', '套系数量', '套系金额', '套系均价',
-                     '二销金额', '二销均价', '客诉退款金额', '总收入']
+                     '二销金额', '二销订单数', '二销均价', '客诉退款金额', '总收入']
         desired_cost_order = [
             '推广费用（实际）',
             '交付费用（主持）',
@@ -523,8 +525,10 @@ def generate_profit_report_multi_month(*period_months, promo_mode='actual'):
 
     if '套系金额' in result.columns and '套系数量' in result.columns:
         result['套系均价'] = result['套系金额'] / result['套系数量']
-    if '二销金额' in result.columns and '套系数量' in result.columns:
-        result['二销均价'] = result['二销金额'] / result['套系数量']
+    if '二销金额' in result.columns and '二销订单数' in result.columns:
+        # 多月合并：分母 = 各月「有二销订单数」之和（second_sales>0），非套系数量（2026-11-24 修正）
+        result['二销均价'] = result.apply(
+            lambda r: r['二销金额'] / r['二销订单数'] if r['二销订单数'] else 0.0, axis=1)
     if '总收入' in result.columns and '总直接成本' in result.columns and '总间接成本' in result.columns:
         result['利润合计'] = result['总收入'] - result['总直接成本'] - result['总间接成本']
         result['利润率'] = result.apply(lambda r: r['利润合计'] / r['总收入'] if r['总收入'] else 0, axis=1)
@@ -532,7 +536,7 @@ def generate_profit_report_multi_month(*period_months, promo_mode='actual'):
     # ========== 重新按总期间统一分摊人工成本 ==========
     db = SessionLocal()
     try:
-        salary_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资','售后服务工资','AI与数据中心工资','视频剪辑部工资']
+        salary_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资','售后服务工资','AI与数据中心工资']
 
         travel_salary = {item: 0.0 for item in salary_items}
         wedding_salary = {item: 0.0 for item in salary_items}
@@ -616,16 +620,3 @@ def generate_profit_report_multi_month(*period_months, promo_mode='actual'):
         db.close()
 
     return result
-
-
-def clear_profit_cache() -> None:
-    """清空利润报表缓存。写操作（导入/维护成本等）成功后调用，
-    避免用户在 10 分钟缓存窗口内看到旧数字。任何异常都不得影响调用方。"""
-    try:
-        generate_profit_report.clear()
-    except Exception:
-        pass
-    try:
-        generate_profit_report_multi_month.clear()
-    except Exception:
-        pass

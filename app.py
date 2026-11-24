@@ -11,10 +11,7 @@ from import_center import import_center_page, inject_ic_css as _ic_css
 import auth_persist as _auth
 from database import SessionLocal, User, Order, SetStandardCost, ActualDirectCost, CherryProductCost, IndirectCost, AllocationRule, OperationLog, MonthlyStats, ModulePermission, ProfitSnapshot, EmployeeSalary
 from profit_engine import generate_profit_report, generate_profit_report_multi_month, is_excluded_order
-import streamlit.components.v1 as components
-from dual_report_v3 import render as render_brief_report
-import hist_yoy
-from sqlalchemy import func, or_
+from sqlalchemy import func
 from werkzeug.security import generate_password_hash, check_password_hash
 import re
 import calendar
@@ -58,23 +55,6 @@ SET_TYPE_MAP = {
     "16980新疆婚礼": "婚礼", "9999纯拍婚礼丽江": "婚礼",
 }
 
-# 系统认可的工资部门（唯一口径来源）。改动此列表时，必须同步
-# profit_engine.py 里的 salary_items（两处），否则该部门工资会计入不到人工成本。
-SALARY_DEPTS = ['策划部', '销售部', '运营部', '综合部', '总经办', '售后服务',
-                'AI与数据中心', '视频剪辑部']
-
-# 运营成本账号别名：同一账号在账单里出现过不同写法 → 归并成右边的统一名称。
-# 汇报附表（🏢 运营成本）与「📋 运营成本查询」页都按此归并；再发现重复写法时加一行即可。
-OPS_ACCOUNT_ALIAS = {
-    'Dou+': '抖音：抖+消耗',
-}
-
-
-def _ops_account(name):
-    """运营成本账号名归一：去掉首尾空白后查别名表。"""
-    _k = (name or '').strip()
-    return OPS_ACCOUNT_ALIAS.get(_k, _k or '（未命名账号）')
-
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'user_id' not in st.session_state: st.session_state.user_id = None
 if 'username' not in st.session_state: st.session_state.username = None
@@ -103,27 +83,11 @@ def add_log(user_id, username, action, details=""):
     try:
         log = OperationLog(user_id=user_id, username=username, action=action, details=details)
         db.add(log); db.commit()
-    except Exception: pass
+    except: pass
     finally: db.close()
 
 def standardize_period(raw):
-    # 兼容数值型期间：Excel 日期序列号（如 46266 → 2026-09）、纯数字年月（如 202609）
-    # 背景：WPS/Excel 里同一列的单元格格式可能不一致，部分存成日期、部分是数字，
-    # 直接 str() 会得到 "46266" 这种错误期间，且混合类型会让 groupby 直接报错。
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and pd.notna(raw):
-        n = float(raw)
-        if n.is_integer():
-            ni = int(n)
-            if 190001 <= ni <= 300012:              # 202609 形式
-                return f"{ni // 100:04d}-{ni % 100:02d}"
-            if 1 <= ni <= 200000:                   # Excel 日期序列号（1899-12-30 起算）
-                ts = pd.Timestamp('1899-12-30') + pd.Timedelta(days=ni)
-                return f"{ts.year:04d}-{ts.month:02d}"
-    if isinstance(raw, (datetime, date, pd.Timestamp)):
-        return f"{raw.year:04d}-{raw.month:02d}"
     s = str(raw).strip()
-    if s.isdigit() and len(s) == 6:                 # "202609" 字符串形式
-        return f"{int(s[:4]):04d}-{int(s[4:]):02d}"
     if '年' in s and '月' in s:
         parts = s.replace('年', ' ').replace('月', '').split()
         if len(parts) >= 2:
@@ -137,20 +101,18 @@ def login_page():
     password = st.text_input("密码", type="password")
     if st.button("登 录"):
         db = SessionLocal()
-        try:
-            user = db.query(User).filter_by(username=username).first()
-            if user and check_password_hash(user.password_hash, password):
-                st.session_state.logged_in = True
-                st.session_state._login_ts = time.time()
-                st.session_state.user_id = user.id
-                st.session_state.username = user.username
-                st.session_state.role = user.role
-                _auth.save_login(user.username, user.role, user.id)  # 写入持久化 cookie
-                add_log(user.id, user.username, "登录", "登录成功")
-                st.success("登录成功！"); st.rerun()
-            else: st.error("用户名或密码错误")
-        finally:
-            db.close()
+        user = db.query(User).filter_by(username=username).first()
+        if user and check_password_hash(user.password_hash, password):
+            st.session_state.logged_in = True
+            st.session_state._login_ts = time.time()
+            st.session_state.user_id = user.id
+            st.session_state.username = user.username
+            st.session_state.role = user.role
+            _auth.save_login(user.username, user.role, user.id)  # 写入持久化 cookie
+            add_log(user.id, user.username, "登录", "登录成功")
+            st.success("登录成功！"); st.rerun()
+        else: st.error("用户名或密码错误")
+        db.close()
     st.caption("默认管理员：admin")
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -169,6 +131,11 @@ def has_permission(module_name, role):
     perm_map = get_permission_map()
     allowed = perm_map.get(module_name, ['admin'])
     return role in allowed
+
+def mask_numeric(value):
+    if isinstance(value, (int, float)):
+        return '***'
+    return value
 
 def mask_dataframe(df):
     if df.empty:
@@ -200,9 +167,6 @@ _WB_MENU = [
     "📜 操作日志",
 ]
 
-# ---- 仅管理员可见的菜单项（用于按角色过滤侧边栏；业务页一律不受影响）----
-_ADMIN_ONLY_MENU = ("🔐 权限管理", "👥 用户管理")
-
 # ---- 已收进导入中心的入口（保留变量以便将来恢复/排查，不在菜单中显示）----
 _WB_MENU_HIDDEN = [
     "📥 导入收入数据",
@@ -219,13 +183,6 @@ _WB_MENU_HIDDEN = [
 ]
 
 
-def _menu_for_role(role):
-    """按角色过滤侧边栏菜单。仅隐藏管理类页面；业务页面保持所有人可见（原行为不变）。"""
-    if role == 'admin':
-        return list(_WB_MENU)
-    return [m for m in _WB_MENU if m not in _ADMIN_ONLY_MENU]
-
-
 def main_sidebar():
     with st.sidebar:
         st.title(f"👤 {st.session_state.username}")
@@ -235,19 +192,13 @@ def main_sidebar():
         # 必须在 st.radio 创建之前，直接设置 widget 的 key（"nav_menu"）。
         # restore_page 只接受 _WB_MENU 内的合法值，天然完成「非法/越权回退」。
         # 仅当 session_state 里还没有本次会话的选择时才恢复，避免覆盖用户刚点的菜单。
-        _menu = _menu_for_role(st.session_state.role)
         if "nav_menu" not in st.session_state:
-            _saved_page = _auth.restore_page(_menu)
+            _saved_page = _auth.restore_page(_WB_MENU)
             if _saved_page:
                 st.session_state["nav_menu"] = _saved_page
         # ---- 工作台跳转通道（必须在 radio 之前）----
         _wb_handle_goto(_WB_MENU)
-        # 兜底：若 session_state 里的导航项不属于当前角色菜单（如管理员退出后同会话以
-        # editor 登录、nav_menu 残留管理页值），回退到菜单首项，避免 st.radio 因值不在
-        # 选项中而报错（线上 Streamlit 版本行为不一致，最坏会整站白屏）。
-        if st.session_state.get("nav_menu") not in _menu:
-            st.session_state["nav_menu"] = _menu[0]
-        menu = st.radio("导航菜单", _menu, key="nav_menu")
+        menu = st.radio("导航菜单", _WB_MENU, key="nav_menu")
         # 把最终选中的页面写回 URL，供刷新后恢复（值不变时内部不写，避免多余 rerun）
         _auth.save_current_page(menu)
         st.divider()
@@ -275,9 +226,6 @@ def main_sidebar():
         return menu
 
 def permission_management_page():
-    if st.session_state.role != 'admin':
-        st.error("无权限：该页面仅管理员可访问。")
-        st.stop()
     st.header("🔐 模块权限管理")
     st.markdown("设置每个功能模块允许查看真实数据的角色（未配置的模块默认仅管理员可看）。")
     all_modules = [
@@ -514,7 +462,7 @@ const REPORT_DATA = __REPORT_DATA_JSON__;
         var v = r[col];
         if (STRING_COLS.indexOf(col) !== -1){
           html += '<td>' + (v === null || v === undefined ? '—' : String(v)) + '</td>';
-        } else if (col === '套系数量'){
+        } else if (col === '套系数量' || col === '二销订单数'){
           html += '<td>' + fmtInt(v) + '</td>';
         } else if (col === '利润率'){
           html += '<td>' + fmtPct(v) + '</td>';
@@ -652,7 +600,6 @@ def generate_html_report(df_biz, total_income, total_direct, total_indirect, tot
     </div>
 
     <div class="caliber-note">同比/环比分析基于导出口径：{caliber_label}</div>
-    <div class="caliber-note" style="margin-top:4px;">口径用途：<b>股东、财务对账</b>请选「实际口径」（与实际支出一致）；<b>销售部经营分析</b>请选「分摊口径」。</div>
 
     <div class="section-title">📸 拍摄费用明细分析（含同比）</div>
     <div class="table-wrapper">
@@ -882,15 +829,13 @@ def view_profit_history_page():
         "</div></div>",
         unsafe_allow_html=True)
 
-    # 口径说明条（2026-10-13 修正文案：原文与实际算法不符，易误导看报表的人）
+    # 口径说明条
     if _mode == 'allocation':
-        _tip = ("分摊口径 —— 人工成本、推广费按「下单订单数」分摊到各套系。"
-                "分摊后这两项的合计会小于实际支出，只反映「选片订单自己承担的那一份」。"
-                "👉 用途：销售部经营分析（看套系定价、获客效率）。")
+        _tip = ("分摊口径 —— 人工、推广费按下单订单数分摊到各套系，"
+                "用于评估套系本身定价是否合理。")
     else:
-        _tip = ("实际口径 —— 人工成本、推广费按「选片订单数」分摊，"
-                "两项合计与实际支出完全一致（经 1–7 月实测，推广费差 0.01 元、人工成本差 0.00 元）。"
-                "👉 用途：股东、财务对账（真实盈利）。")
+        _tip = ("实际口径 —— 推广费按实际发生计入，人工按下单订单数分摊，"
+                "更接近当期真实现金成本。")
     st.markdown(
         "<div class='ph-mode'>"
         f"<div class='ph-mbtn on'>{mode_label}</div>"
@@ -1006,59 +951,44 @@ def view_profit_history_page():
 
     # ==================== 费用结构 ====================
     st.markdown("<div class='ph-sec'>费用结构</div>", unsafe_allow_html=True)
-    st.markdown("<div class='ph-hint'>各费用项合计金额与占直接成本比重。"
-                "<b>直接成本</b>＝拍摄、推广、交付(主持/场地/搭建)、鲜花、微电影拍摄与剪辑、"
-                "二销选片、像素蛋糕、后期修片(一销/二销)、工厂(一销/二销)、人工成本(7部门工资)；"
-                "<b>间接成本</b>＝房租水电办公、税费及手续费、样片研发、场地铺设、舆情处理。"
-                "占比列统一以总直接成本为基数，便于横向比较。</div>",
+    st.markdown("<div class='ph-hint'>各费用项合计金额与占直接成本比重。</div>",
                 unsafe_allow_html=True)
 
-    # 类别：D = 直接成本，I = 间接成本（与 profit_engine 口径一致）
     _FEE = [
-        ('拍摄费用', 'D', '摄影师、化妆师、助理等团队费用，占比最大'),
-        ('推广费用（实际）', 'D', '线上线下广告投放、推广活动（计入直接成本）'),
-        ('交付费用（主持）', 'D', '婚礼主持费用，仅婚礼订单产生'),
-        ('交付费用（场地）', 'D', '婚礼及旅拍场地租赁费，含自租场地'),
-        ('交付费用（搭建）', 'D', '婚礼现场搭建布置费用'),
-        ('鲜花费用', 'D', '婚礼鲜花布置及手捧花等'),
-        ('微电影拍摄费用', 'D', '微电影前期拍摄团队成本'),
-        ('微电影剪辑费用', 'D', '微电影后期剪辑成本'),
-        ('二销选片费', 'D', '门店二销结算费用，按选片金额提成'),
-        ('像素蛋糕修图费', 'D', '第三方修图服务费'),
-        ('后期修片费(一销)', 'D', '一销订单后期修片成本'),
-        ('后期修片费(二销)', 'D', '二销订单后期修片成本'),
-        ('工厂费用（一销）', 'D', '相册、相框等工厂制作费（一销）'),
-        ('工厂费用（二销）', 'D', '相册、相框等工厂制作费（二销）'),
-        ('人工成本', 'D', '策划部、销售部、运营部、综合部、总经办、售后服务、AI与数据中心、视频剪辑部 8 个部门工资，按订单数分摊（计入直接成本）'),
-        ('房租、水电、办公费等', 'I', '固定运营成本分摊'),
-        ('税费及手续费', 'I', '平台手续费、税费'),
-        ('样片研发', 'I', '样片拍摄与研发投入'),
-        ('场地铺设费', 'I', '场地建设与铺设投入'),
-        ('舆情处理', 'I', '口碑维护与客诉处理'),
+        ('拍摄费用', '摄影师、化妆师、助理等团队费用，占比最大'),
+        ('推广费用（实际）', '线上线下广告投放、推广活动'),
+        ('交付费用（主持）', '婚礼主持费用，仅婚礼订单产生'),
+        ('交付费用（场地）', '婚礼及旅拍场地租赁费，含自租场地'),
+        ('交付费用（搭建）', '婚礼现场搭建布置费用'),
+        ('鲜花费用', '婚礼鲜花布置及手捧花等'),
+        ('微电影拍摄费用', '微电影前期拍摄团队成本'),
+        ('微电影剪辑费用', '微电影后期剪辑成本'),
+        ('二销选片费', '门店二销结算费用，按选片金额提成'),
+        ('像素蛋糕修图费', '第三方修图服务费'),
+        ('后期修片费(一销)', '一销订单后期修片成本'),
+        ('后期修片费(二销)', '二销订单后期修片成本'),
+        ('工厂费用（一销）', '相册、相框等工厂制作费（一销）'),
+        ('工厂费用（二销）', '相册、相框等工厂制作费（二销）'),
+        ('人工成本', '员工薪酬分摊（按订单数）'),
+        ('房租、水电、办公费等', '固定运营成本分摊'),
+        ('税费及手续费', '平台手续费、税费'),
+        ('样片研发', '样片拍摄与研发投入'),
+        ('场地铺设费', '场地建设与铺设投入'),
+        ('舆情处理', '口碑维护与客诉处理'),
     ]
-    _CAT_STYLE = {
-        'D': ("直接成本", "background:#fdecea;color:#c0392b;border:1px solid #f5c6c0"),
-        'I': ("间接成本", "background:#fef5e7;color:#b9770e;border:1px solid #f7dcae"),
-    }
     _tot_dir = float(vdf['总直接成本'].sum()) if '总直接成本' in vdf.columns else 0.0
     _fee_rows = []
-    for _name, _cat, _desc in _FEE:
+    for _name, _desc in _FEE:
         if _name not in vdf.columns:
             continue
-        # 推广费显示名随口径切换（底层列名固定为「推广费用（实际）」，仅改显示）
-        _disp = ('推广费用（分摊）' if mode_label == '分摊口径' else '推广费用（实际）') \
-            if _name == '推广费用（实际）' else _name
         _val = float(vdf[_name].sum())
         if _val <= 0:
             continue
         _pct = (_val / _tot_dir * 100) if _tot_dir else 0.0
         _w = min(100.0, _pct * 1.6)
-        _cat_txt, _cat_css = _CAT_STYLE[_cat]
         _fee_rows.append(
             "<tr>"
-            f"<td class='l'>{_disp}</td>"
-            f"<td style='width:86px'><span style='display:inline-block;white-space:nowrap;"
-            f"padding:1px 8px;border-radius:9px;font-size:12px;{_cat_css}'>{_cat_txt}</span></td>"
+            f"<td class='l'>{_name}</td>"
             f"<td style='width:150px'>{_ph_fmt(_val)}</td>"
             "<td style='width:190px'>"
             f"<span class='ph-bar' style='width:{_w:.1f}px'></span>{_pct:.2f}%</td>"
@@ -1070,7 +1000,6 @@ def view_profit_history_page():
             "<div class='ph-tb'><table>"
             "<thead><tr>"
             "<th class='l'>费用项</th>"
-            "<th style='width:86px'>类别</th>"
             "<th style='width:150px'>金额</th>"
             "<th style='width:190px'>占直接成本</th>"
             "<th class='l' style='width:300px'>说明</th>"
@@ -1339,115 +1268,6 @@ def view_profit_history_page():
         v = float(v)
         return f"{v / 10000:,.2f}万" if abs(v) >= 10000 else f"{v:,.2f}"
 
-    # ==================== 双口径对照（汇报用）====================
-    # 只做「把两套口径并列展示 + 解释差额来源」，不参与任何计算口径，
-    # 两套数字仍分别来自 generate_profit_report_multi_month(promo_mode=...)。
-    def _build_dual_caliber_html(df_a, df_b, la, lb, span, biz, pair_rows, loss_a, loss_b, both_loss):
-        _gen = datetime.now().strftime('%Y-%m-%d %H:%M')
-        inc_a = float(df_a['总收入'].sum())
-        inc_b = float(df_b['总收入'].sum())
-        prof_a = float(df_a['利润合计'].sum())
-        prof_b = float(df_b['利润合计'].sum())
-        rate_a = (prof_a / inc_a * 100) if inc_a else 0.0
-        rate_b = (prof_b / inc_b * 100) if inc_b else 0.0
-
-        def _col(v):
-            return '#c0392b' if v >= 0 else '#27ae60'
-
-        _sum_rows = []
-        for _name, _va, _vb in pair_rows:
-            _d = _va - _vb
-            # 只有「收入/利润」行按红涨绿跌着色；成本行的差额不带语义色，避免误读
-            _c = ('pos' if _d >= 0 else 'neg') if _name in ('总收入', '利润合计') else ''
-            _sum_rows.append(
-                f"<tr><td class='l'>{_name}</td>"
-                f"<td>{_exp_wan(_va)}</td><td>{_exp_wan(_vb)}</td>"
-                f"<td class='{_c}'>{_exp_wan(_d)}</td></tr>")
-
-        _rk_rows = []
-        for _i, (_n, _bizn, _cnt, _pa, _pb) in enumerate(both_loss, 0):
-            _rk_rows.append(
-                f"<tr><td class='l'>{_ph_esc(_n)}</td><td class='c'>{_ph_esc(_bizn)}</td>"
-                f"<td>{_cnt:,}</td><td style='color:{_col(_pa)}'>{_exp_wan(_pa)}</td>"
-                f"<td style='color:{_col(_pb)}'>{_exp_wan(_pb)}</td></tr>")
-
-        _html = f"""<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>双口径利润对照报告 · {span}</title>
-<style>
-*{{box-sizing:border-box}}
-body{{margin:0;background:#f4f6fa;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#1f2d3d}}
-.wrap{{max-width:1080px;margin:0 auto;padding:28px 20px 60px}}
-.hd{{background:linear-gradient(135deg,#4f46e5,#6366f1);border-radius:14px;padding:22px 26px;color:#fff}}
-.hd h1{{margin:0 0 8px;font-size:23px}}
-.hd .meta{{font-size:13.5px;opacity:.93;line-height:1.8}}
-.cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}}
-.card{{background:#fff;border-radius:12px;padding:14px 16px;box-shadow:0 1px 3px rgba(16,42,67,.08)}}
-.card .k{{font-size:12.5px;color:#8296a8;margin-bottom:6px}}
-.card .v{{font-size:20px;font-weight:700}}
-.card .s{{font-size:11.5px;color:#9aa9b8;margin-top:5px}}
-.sec{{font-size:16px;font-weight:700;margin:26px 0 10px;padding-left:10px;border-left:4px solid #4f46e5}}
-.note{{background:#eef2ff;border:1px solid #c7d2fe;border-radius:10px;padding:12px 16px;font-size:13px;line-height:1.95}}
-.tb{{background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(16,42,67,.08)}}
-table{{width:100%;border-collapse:collapse;font-size:13.5px}}
-th{{background:#f7f9fc;color:#5b6b7c;font-weight:600;padding:10px 12px;text-align:right;border-bottom:1px solid #e8eef5}}
-th.l,td.l{{text-align:left}}
-td{{padding:10px 12px;text-align:right;border-bottom:1px solid #f2f5f9}}
-tr:last-child td{{border-bottom:0}}
-.pos{{color:#c0392b}}.neg{{color:#059669}}
-.ft{{text-align:center;font-size:12px;color:#95a5b6;margin-top:26px;line-height:1.9}}
-ul{{margin:8px 0 0 18px;padding:0;font-size:13px;line-height:2}}
-</style></head><body><div class="wrap">
-  <div class="hd">
-    <h1>双口径利润对照报告</h1>
-    <div class="meta">数据区间：{span}　·　业务线：{biz}　·　共 {len(df_a)} 个套系 / {int(df_a['套系数量'].sum()):,} 单<br>
-    口径 A：{la}　·　口径 B：{lb}　·　生成时间：{_gen}</div>
-  </div>
-  <div class="cards">
-    <div class="card"><div class="k">总收入（两口径相同）</div><div class="v">{_exp_wan(inc_a)}</div>
-      <div class="s">收入不受口径影响</div></div>
-    <div class="card"><div class="k">利润 · {la}</div>
-      <div class="v" style="color:{_col(prof_a)}">{_exp_wan(prof_a)}</div>
-      <div class="s">利润率 {rate_a:.2f}%</div></div>
-    <div class="card"><div class="k">利润 · {lb}</div>
-      <div class="v" style="color:{_col(prof_b)}">{_exp_wan(prof_b)}</div>
-      <div class="s">利润率 {rate_b:.2f}%</div></div>
-    <div class="card"><div class="k">两口径利润差</div>
-      <div class="v">{_exp_wan(prof_a - prof_b)}</div>
-      <div class="s">A − B</div></div>
-  </div>
-
-  <div class="note"><b>两个口径为什么不一样？</b><br>
-  · <b>{la}</b>：人工成本、推广费按「{la == '实际口径' and '选片订单数' or '下单订单数'}」分摊，两项合计{la == '实际口径' and '与实际支出完全一致，可与财务账对账（给股东、财务看）' or '小于实际支出，只反映选片订单自己承担的那一份（给销售部做经营分析）'}。<br>
-  · <b>{lb}</b>：同上，分母换成「{lb == '实际口径' and '选片订单数' or '下单订单数'}」，合计{lb == '实际口径' and '与实际支出完全一致' or '小于实际支出'}。<br>
-  · <b>结论：收入两边必然相同，差额只出现在「人工成本 + 推广费」这两项上，其余 18 个费用项两边一致。</b></div>
-
-  <div class="sec">一、汇总对照</div>
-  <div class="tb"><table>
-    <thead><tr><th class="l">项目</th><th>口径 A · {la}</th><th>口径 B · {lb}</th><th>A − B</th></tr></thead>
-    <tbody>{''.join(_sum_rows)}</tbody>
-  </table></div>
-
-  <div class="sec">二、两口径都亏损的套系（真实亏损，需重点处理）</div>
-  <div class="tb"><table>
-    <thead><tr><th class="l">套系</th><th class="c">业务线</th><th>单数</th><th>{la} 利润</th><th>{lb} 利润</th></tr></thead>
-    <tbody>{''.join(_rk_rows) or '<tr><td colspan="5" style="text-align:center;color:#95a5b6">两个口径下均无亏损套系</td></tr>'}</tbody>
-  </table></div>
-
-  <div class="sec">三、经营建议（自动提示）</div>
-  <div class="note"><ul>
-    <li>{la} 亏损套系 <b>{loss_a}</b> 个，{lb} 亏损套系 <b>{loss_b}</b> 个，两者都亏 <b>{len(both_loss)}</b> 个。</li>
-    <li>两个口径<b>都亏损</b>的套系 → <b>真实亏损</b>，建议核对该套系成本录入是否完整，并评估是否继续售卖。</li>
-    <li>只有一个口径亏损、另一个口径盈利的套系 → 属<b>成本分摊敏感型</b>：差异全部来自人工与推广的分母不同，说明该套系对获客成本与人力投入敏感，优先调价或控投。</li>
-    <li>给股东汇报用<b>实际口径</b>（与实际支出对账一致）；给销售部用<b>分摊口径</b>（看套系自身赚钱能力）。</li>
-  </ul></div>
-
-  <div class="ft">本报告由「旅拍利润系统」生成 · 双口径并列展示，不改动任何计算口径<br>
-  {span} · {biz} · 生成时间 {_gen} · 单文件离线可开，可直接转发</div>
-</div></body></html>"""
-        return _html
-
     def _build_profit_history_html(src, span, ml, biz):
         """把当前筛选结果渲染成完整独立 HTML 报告。"""
         _inc = float(src['总收入'].sum())
@@ -1477,21 +1297,15 @@ ul{{margin:8px 0 0 18px;padding:0;font-size:13px;line-height:2}}
         # —— 费用结构行 ——
         _fee_rows = []
         _fee_total = 0.0
-        for _n, _cat, _d in _FEE:
+        for _n, _d in _FEE:
             if _n not in src.columns:
                 continue
-            # 推广费显示名随口径切换（底层列名固定，仅改显示）
-            _disp = ('推广费用（分摊）' if '分摊' in str(ml) else '推广费用（实际）') \
-                if _n == '推广费用（实际）' else _n
             _v = float(src[_n].sum())
             if _v <= 0:
                 continue
             _fee_total += _v
-            _cat_txt, _cat_css = _CAT_STYLE[_cat]
             _fee_rows.append(
-                f"<tr><td class='l'>{_disp}</td>"
-                f"<td><span style='display:inline-block;white-space:nowrap;padding:1px 8px;"
-                f"border-radius:9px;font-size:12px;{_cat_css}'>{_cat_txt}</span></td>"
+                f"<tr><td class='l'>{_n}</td>"
                 f"<td>{_exp_wan(_v)}</td>"
                 f"<td>{(_v / _inc * 100) if _inc else 0:.2f}%</td></tr>")
 
@@ -1545,8 +1359,8 @@ tfoot td.l{{text-align:left}}
     <div class="meta">数据区间：{span}　·　共 {len(src)} 个套系 / {_units:,} 单<br>
     费用口径：{ml}　·　业务线：{biz}</div>
   </div>
-  <div class="mode">{ml} —— {'人工成本、推广费按「下单订单数」分摊到各套系，分摊后合计小于实际支出，用于销售部经营分析（看套系定价与获客效率）。'
-    if ml == '分摊口径' else '人工成本、推广费按「选片订单数」分摊，两项合计与实际支出一致，可用于与财务账/利润表模板对账，供股东查看真实盈利。'}</div>
+  <div class="mode">{ml} —— {'人工、推广费按下单订单数分摊到各套系，用于评估套系定价合理性。'
+    if ml == '分摊口径' else '只统计实际发生的费用，未分摊的固定成本不纳入，反映真实现金流成本。'}</div>
   <div class="cards">
     <div class="card"><div class="k">套系总数</div><div class="v">{len(src)}</div></div>
     <div class="card"><div class="k">订单总数</div><div class="v">{_units:,}</div></div>
@@ -1571,12 +1385,11 @@ tfoot td.l{{text-align:left}}
   </table></div>
   <div class="sec">费用结构</div>
   <div class="tb"><table>
-    <thead><tr><th class="l">费用项</th><th>类别</th><th>金额</th><th>占收入</th></tr></thead>
-    <tbody>{''.join(_fee_rows) or '<tr><td colspan="4" style="text-align:center;color:#95a5b6">无费用数据</td></tr>'}</tbody>
-    <tfoot><tr><td class="l">费用合计</td><td>—</td><td>{_exp_wan(_fee_total)}</td>
+    <thead><tr><th class="l">费用项</th><th>金额</th><th>占收入</th></tr></thead>
+    <tbody>{''.join(_fee_rows) or '<tr><td colspan="3" style="text-align:center;color:#95a5b6">无费用数据</td></tr>'}</tbody>
+    <tfoot><tr><td class="l">费用合计</td><td>{_exp_wan(_fee_total)}</td>
       <td>{(_fee_total / _inc * 100) if _inc else 0:.2f}%</td></tr></tfoot>
-  </table>
-  <div class="ft" style="border:0;padding:6px 2px 0">直接成本＝拍摄、推广、交付(主持/场地/搭建)、鲜花、微电影拍摄与剪辑、二销选片、像素蛋糕、后期修片(一销/二销)、工厂(一销/二销)、人工成本(7部门工资)；间接成本＝房租水电办公、税费及手续费、样片研发、场地铺设、舆情处理。</div></div>
+  </table></div>
   <div class="sec">成本与利润结构</div>
   <div class="tb"><table>
     <thead><tr><th class="l">项目</th><th>金额</th><th>占收入</th></tr></thead>
@@ -1599,164 +1412,6 @@ tfoot td.l{{text-align:left}}
     st.download_button(
         "📥 导出 HTML 报告", _export_html.encode('utf-8'),
         f"利润表历史报告_{_span_txt}_{mode_label}_{_biz}.html", "text/html")
-
-    # ==================== 双口径对照（汇报用）====================
-    st.markdown("<div class='ph-sec'>双口径对照（汇报用）</div>", unsafe_allow_html=True)
-    st.markdown(
-        "<div class='ph-hint'>同一批数据、两套口径并列。<b>实际口径</b>＝人工与推广按「选片订单数」分摊，"
-        "合计与实际支出一致 → 给股东、财务对账；<b>分摊口径</b>＝按「下单订单数」分摊，"
-        "合计小于实际支出 → 给销售部做经营分析。收入两边必然相同，差额只出现在人工成本与推广费两项。</div>",
-        unsafe_allow_html=True)
-
-    _other_label = '分摊口径' if _mode == 'actual' else '实际口径'
-    _other_mode = 'allocation' if _mode == 'actual' else 'actual'
-    try:
-        with st.spinner(f"正在计算「{_other_label}」…"):
-            _other_raw = generate_profit_report_multi_month(*sel_months, promo_mode=_other_mode)
-    except Exception as _e:
-        _other_raw = pd.DataFrame()
-        st.warning(f"「{_other_label}」计算失败：{_e}")
-
-    if not can_see:
-        # 无查看真实数字权限的账号：明细一律不展示，避免脱敏数据进入对照计算
-        st.markdown("<div class='ph-hint'>当前账号无查看真实数字的权限，双口径对照明细不展示。</div>",
-                    unsafe_allow_html=True)
-    elif _other_raw is None or _other_raw.empty:
-        st.info(f"「{_other_label}」在该区间暂无数据，无法对照")
-    else:
-        _odf = _other_raw if _biz == '全部' else _other_raw[_other_raw['业务类型'] == _biz].copy()
-
-        def _dsum(dfx, col):
-            try:
-                return float(dfx[col].sum()) if (col in getattr(dfx, 'columns', []) and len(dfx)) else 0.0
-            except Exception:
-                return 0.0
-
-        _a_inc, _b_inc = _dsum(vdf, '总收入'), _dsum(_odf, '总收入')
-        _a_prof, _b_prof = _dsum(vdf, '利润合计'), _dsum(_odf, '利润合计')
-        _a_sal, _b_sal = _dsum(vdf, '人工成本'), _dsum(_odf, '人工成本')
-        _a_promo, _b_promo = _dsum(vdf, '推广费用（实际）'), _dsum(_odf, '推广费用（实际）')
-        _a_dc, _b_dc = _dsum(vdf, '总直接成本'), _dsum(_odf, '总直接成本')
-        _a_ic, _b_ic = _dsum(vdf, '总间接成本'), _dsum(_odf, '总间接成本')
-
-        _pair_rows = [
-            ('总收入', _a_inc, _b_inc),
-            ('人工成本', _a_sal, _b_sal),
-            ('推广费用', _a_promo, _b_promo),
-            ('总直接成本', _a_dc, _b_dc),
-            ('总间接成本', _a_ic, _b_ic),
-            ('总成本', _a_dc + _a_ic, _b_dc + _b_ic),
-            ('利润合计', _a_prof, _b_prof),
-        ]
-
-        _dual_rows = []
-        for _nm, _va, _vb in _pair_rows:
-            _d = _va - _vb
-            # 只有「收入/利润」行按红涨绿跌着色；成本行的差额不带语义色
-            if _nm in ('总收入', '利润合计'):
-                _c = 'ph-up' if _d >= 0 else 'ph-down'
-            else:
-                _c = ''
-            _dual_rows.append(
-                "<tr>"
-                f"<td class='l'>{_nm}</td>"
-                f"<td>{_ph_fmt(_va)}</td><td>{_ph_fmt(_vb)}</td>"
-                f"<td class='{_c}'>{_ph_fmt(_d)}</td></tr>")
-        _dual_rows.append(
-            "<tr>"
-            "<td class='l'>利润率</td>"
-            f"<td>{(_a_prof / _a_inc * 100) if _a_inc else 0:.2f}%</td>"
-            f"<td>{(_b_prof / _b_inc * 100) if _b_inc else 0:.2f}%</td>"
-            f"<td>{( (_a_prof / _a_inc * 100) if _a_inc else 0) - ((_b_prof / _b_inc * 100) if _b_inc else 0):.2f}pt</td>"
-            "</tr>")
-
-        st.markdown(
-            "<div class='ph-tb'><table>"
-            "<thead><tr>"
-            "<th class='l'>项目</th>"
-            f"<th style='width:150px'>{mode_label}（当前）</th>"
-            f"<th style='width:150px'>{_other_label}</th>"
-            "<th style='width:150px'>差额</th>"
-            "</tr></thead><tbody>" + "".join(_dual_rows) + "</tbody></table></div>",
-            unsafe_allow_html=True)
-
-        _under = (_a_sal + _a_promo) - (_b_sal + _b_promo) if _mode == 'actual' else (_b_sal + _b_promo) - (_a_sal + _a_promo)
-        st.markdown(
-            f"<div class='ph-hint'>差额来源：分摊口径下「人工成本 + 推广费」合计比实际口径"
-            f"<b>少 {_ph_fmt(_under)}</b>（分母用了下单订单数，选片订单只承担自己那份），"
-            "其余 18 个费用项两口径完全一致，收入也一致。差额列里，<b>收入/利润行</b>红色=当前口径更高、"
-            "绿色=更低；<b>成本行</b>不配色（正数表示当前口径成本更高）。</div>",
-            unsafe_allow_html=True)
-
-        # —— 套系级：两口径利润对照（按差额绝对值降序，取前 15）——
-        _mrg = pd.merge(
-            vdf[['业务类型', '套系', '套系数量', '利润合计']],
-            _odf[['套系', '利润合计']].rename(columns={'利润合计': '对口径利润'}),
-            on='套系', how='outer')
-        _mrg['利润合计'] = _mrg['利润合计'].fillna(0.0)
-        _mrg['对口径利润'] = _mrg['对口径利润'].fillna(0.0)
-        _mrg['单数x'] = _mrg['套系数量'].fillna(0)
-        _mrg['业务类型'] = _mrg['业务类型'].fillna('')
-        # 「本口径」= 页面当前所选口径
-        if _mode == 'actual':
-            _mrg['本口径利润'] = _mrg['利润合计']
-        else:
-            _mrg['本口径利润'] = _mrg['对口径利润']
-            _mrg['对口径利润'] = _mrg['利润合计']
-        _mrg['口径差额'] = _mrg['本口径利润'] - _mrg['对口径利润']
-
-        _loss_a = int((_mrg['本口径利润'] < 0).sum())
-        _loss_b = int((_mrg['对口径利润'] < 0).sum())
-        _both = _mrg[(_mrg['本口径利润'] < 0) & (_mrg['对口径利润'] < 0)].copy()
-        _both = _both.sort_values('本口径利润').reset_index(drop=True)
-
-        _top = _mrg.reindex(_mrg['口径差额'].abs().sort_values(ascending=False).index).head(15)
-        _top_rows = []
-        for _, _r in _top.iterrows():
-            _c1 = 'ph-up' if float(_r['本口径利润']) >= 0 else 'ph-down'
-            _c2 = 'ph-up' if float(_r['对口径利润']) >= 0 else 'ph-down'
-            _bt = str(_r.get('业务类型', '') or '')
-            _tag = 't-lp' if '旅拍' in _bt else ('t-hl' if '婚礼' in _bt else '')
-            _top_rows.append(
-                "<tr>"
-                f"<td class='l'>{_ph_esc(_r['套系'])}</td>"
-                f"<td class='c'><span class='ph-tag {_tag}'>{_ph_esc(_bt)}</span></td>"
-                f"<td>{int(_r['单数x']):,}</td>"
-                f"<td class='{_c1}'>{float(_r['本口径利润']) / 10000:,.2f}</td>"
-                f"<td class='{_c2}'>{float(_r['对口径利润']) / 10000:,.2f}</td>"
-                f"<td>{float(_r['口径差额']) / 10000:,.2f}</td>"
-                "</tr>")
-        st.markdown(
-            "<div class='ph-tb' style='margin-top:12px'><table>"
-            "<thead><tr>"
-            "<th class='l'>套系（按两口径差额排序）</th><th class='c' style='width:76px'>业务线</th>"
-            "<th style='width:72px'>单数</th>"
-            f"<th style='width:110px'>{mode_label} 利润(万)</th>"
-            f"<th style='width:110px'>{_other_label} 利润(万)</th>"
-            "<th style='width:104px'>差额(万)</th>"
-            "</tr></thead><tbody>" + "".join(_top_rows) + "</tbody></table></div>",
-            unsafe_allow_html=True)
-
-        _both_rows = []
-        for _, _r in _both.head(20).iterrows():
-            _both_rows.append((str(_r['套系']), str(_r.get('业务类型', '') or ''),
-                               int(_r['单数x'] or 0),
-                               float(_r['本口径利润']), float(_r['对口径利润'])))
-
-        st.markdown(
-            f"<div class='ph-hint' style='margin-top:12px'>两个口径<b>都亏损</b>的套系 "
-            f"<b>{len(_both)}</b> 个（真实亏损，建议核对成本录入并评估是否继续售卖）；"
-            "只有一个口径亏损、另一个盈利的套系属<b>成本分摊敏感型</b>，差异全部来自人工与推广的分母不同，"
-            "可优先调价或控投。</div>",
-            unsafe_allow_html=True)
-
-        _dual_html = _build_dual_caliber_html(
-            vdf, _odf, mode_label, _other_label, _span_txt, _biz,
-            _pair_rows, _loss_a, _loss_b, _both_rows)
-        st.download_button(
-            "📥 导出双口径对照报告（含汇总 + 差异拆解 + 亏损套系）",
-            _dual_html.encode('utf-8'),
-            f"双口径对照报告_{_span_txt}_{_biz}.html", "text/html")
 
     # ==================== 历史快照（保留原功能）====================
     st.markdown("<div class='ph-sec'>历史快照</div>", unsafe_allow_html=True)
@@ -1806,104 +1461,6 @@ tfoot td.l{{text-align:left}}
                                 st.rerun()
     finally:
         _db.close()
-
-# ============================================================================
-# 经营利润汇报（双口径 · 可切换）辅助函数
-# ----------------------------------------------------------------------------
-# 纯展示层：只做「取数 → 汇总 → 渲染」，不参与任何成本口径计算。
-# ============================================================================
-def _shift_year_date(d, years=1):
-    """日期整体回退 N 年；2/29 等非法日期兜底到 2/28。"""
-    try:
-        return d.replace(year=d.year - years)
-    except ValueError:
-        return d.replace(year=d.year - years, day=28)
-
-
-def _period_months(start, end):
-    """列出区间覆盖的月份，如 ['2025-01', '2025-02']。"""
-    out, cur = [], start.replace(day=1)
-    while cur <= end:
-        out.append(cur.strftime('%Y-%m'))
-        cur = (cur + timedelta(days=32)).replace(day=1)
-    return out
-
-
-def _hist_rec_from_df(df, biz=None):
-    """把某期报表聚合为同比所需的记录（收入 / 单数 / 推广 / 人工 / 净利润）。"""
-    if df is None or len(df) == 0:
-        return None
-    d = df
-    if biz is not None:
-        if '业务类型' not in df.columns:
-            return None
-        d = df[df['业务类型'].astype(str) == str(biz)]
-        if len(d) == 0:
-            return None
-
-    def _s(col):
-        if col not in d.columns:
-            return 0.0
-        return float(pd.to_numeric(d[col], errors='coerce').fillna(0.0).sum())
-
-    return {'收入': _s('总收入'), '单数': _s('套系数量'), '推广': _s('推广费用（实际）'),
-            '人工': _s('人工成本'), '净利润': _s('利润合计')}
-
-
-def _yoy_pack_from_df(df):
-    """构造汇报模板所需的同比包 {'all': …, 各业务线: …}；无数据时返回 None。"""
-    rec = _hist_rec_from_df(df)
-    if not rec or (abs(rec['收入']) < 0.005 and abs(rec['单数']) < 0.005):
-        return None
-    pack = {'all': rec}
-    if df is not None and '业务类型' in df.columns:
-        for b in pd.Series(df['业务类型']).dropna().astype(str).unique():
-            r = _hist_rec_from_df(df, b)
-            if r:
-                pack[b] = r
-    return pack
-
-
-def _why_ratio_txt(num_ratio, den_ratio, num_cur, num_prev, den_cur, den_prev, den_name='单量'):
-    """把「均价/单均」的环比拆成 分子(费用总额) × 分母(除数) 两个效应，返回一句原因说明。
-
-    纯文字注释，不参与任何数字计算。num_* 为分子（费用总额）环比与金额，
-    den_* 为分母（除数/单量）环比与数值。
-    注意：文字必须短 —— 这列会进页面表格和导出 HTML，带上「（¥a→¥b）」
-    明细会把整张表撑出屏幕（2026-10-21 用户实测截断）。金额本身就在
-    「本期均价 / 上月均价」等相邻列里，这里不重复。
-    """
-    try:
-        if abs(den_ratio) < 0.005 and abs(num_ratio) < 0.005:
-            return "总额与除数基本持平"
-        parts = []
-        num_seg = f"费用总额 {num_ratio:+.1%}"
-        den_seg = f"{den_name} {den_ratio:+.1%}"
-        if abs(num_ratio) >= abs(den_ratio):
-            if abs(num_ratio) >= 0.005:
-                parts.append("主因" + num_seg)
-            if abs(den_ratio) >= 0.005:
-                parts.append("次因" + den_seg)
-        else:
-            if abs(den_ratio) >= 0.005:
-                parts.append("主因" + den_seg)
-            if abs(num_ratio) >= 0.005:
-                parts.append("次因" + num_seg)
-        return "；".join(parts) if parts else "总额与除数基本持平"
-    except Exception:
-        return "—"
-
-
-def _extra_rows(df, columns, title):
-    """把分析用 DataFrame 转成汇报模板的「附录表」结构 (标题, 表头, 行)。"""
-    if df is None or len(df) == 0:
-        return None
-    cols = [c for c in columns]
-    if not all(c in df.columns for c in cols):
-        return None
-    rows = [['—' if pd.isna(v) else str(v) for v in r] for r in df[cols].values.tolist()]
-    return (title, cols, rows)
-
 
 def profit_report_page():
     st.header("📊 利润表生成与分析")
@@ -1970,9 +1527,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
         ('后期修片费(二销)', '后期修片费(二销)', '二销加修照片额外修片成本'),
         ('工厂费用（一销）', '工厂费用(一销)', '产品制作（相册、摆台等）一销部分'),
         ('工厂费用（二销）', '工厂费用(二销)', '产品制作二销加选部分'),
-        ('人工成本', '人工成本', '包含销售部、策划部、运营部、综合部、总经办、售后服务部门工资、AI与数据中心部门工资、视频剪辑部门工资，按订单数分摊'),
+        ('人工成本', '人工成本', '包含销售部、策划部、运营部、综合部、总经办、售后服务部门工资、AI与数据中心部门工资，按订单数分摊'),
         ('房租、水电、办公费等', '房租、水电、办公费等', '办公场所租赁、物业水电、日常办公消耗'),
-        ('税费及手续费', '税费及手续费', '各项税金、支付平台手续费等；银行结息等收入以负数冲减'),
+        ('税费及手续费', '税费及手续费', '各项税金、支付平台手续费等'),
         ('样片研发', '样片研发', '包含新疆拍样费用、样片研发及模特道具等支出'),
         ('场地铺设费', '场地铺设费', '无法归属到具体订单的公共场地布置费用'),
         ('舆情处理', '舆情处理', '种草推广、舆情维护等费用')
@@ -2241,51 +1798,6 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
         for _col in ['本月转化率', '上月转化率', '上年同期转化率']:
             conv_df[_col] = conv_df[_col].apply(lambda r: f"{r:.1%}" if r is not None else "—")
 
-        # ---------- 汇报用转化率表（含毛客数 / 成交单数 / 百分点变化） ----------
-        # 转化率本身是百分比，变化用「个百分点(pp)」表达更直观：
-        # 10.6% → 11.2% 说「+0.60 pp」，而不是容易误读的「+5.7%」。
-        def _pp(cur_r, base_r):
-            if cur_r is None or base_r is None:
-                return "—"
-            d = (cur_r - base_r) * 100
-            return "0.00 pp" if abs(d) < 0.005 else f"{d:+.2f} pp"
-
-        _conv_rows = []
-        for bt in _CONV_BIZ_TYPES:
-            _gl, _oc = _conv_raw['cur'].get(bt, (0, 0))
-            _glp, _ocp = _conv_raw['last'].get(bt, (0, 0))
-            _gll, _ocl = _conv_raw['ly'].get(bt, (0, 0))
-            if not (_gl or _oc or _glp or _gll):
-                continue          # 该业务类型三期都没数据，不占一行
-            _rc = _safe_rate(_gl, _oc)
-            _rp = _safe_rate(_glp, _ocp)
-            _rl = _safe_rate(_gll, _ocl)
-            _conv_rows.append([
-                bt, f"{_gl:,.0f}", f"{_oc:,.0f}",
-                (f"{_rc:.1%}" if _rc is not None else "—"),
-                (f"{_rp:.1%}" if _rp is not None else "—"), _pp(_rc, _rp),
-                (f"{_rl:.1%}" if _rl is not None else "—"), _pp(_rc, _rl),
-            ])
-        # 合计行：转化率必须「总成交 ÷ 总毛客」，不能把各业务线转化率取平均
-        _tg = sum(v[0] for v in _conv_raw['cur'].values())
-        _to = sum(v[1] for v in _conv_raw['cur'].values())
-        _tgp = sum(v[0] for v in _conv_raw['last'].values())
-        _top = sum(v[1] for v in _conv_raw['last'].values())
-        _tgl = sum(v[0] for v in _conv_raw['ly'].values())
-        _tol = sum(v[1] for v in _conv_raw['ly'].values())
-        if _conv_rows and (_tg or _to):
-            _tc, _tp, _tl = _safe_rate(_tg, _to), _safe_rate(_tgp, _top), _safe_rate(_tgl, _tol)
-            _conv_rows.append([
-                '合计', f"{_tg:,.0f}", f"{_to:,.0f}",
-                (f"{_tc:.1%}" if _tc is not None else "—"),
-                (f"{_tp:.1%}" if _tp is not None else "—"), _pp(_tc, _tp),
-                (f"{_tl:.1%}" if _tl is not None else "—"), _pp(_tc, _tl),
-            ])
-        conv_tbl = ('📉 转化率（成交订单数 ÷ 毛客数）',
-                    ['业务类型', '毛客数', '成交单数', '本期转化率',
-                     '上月转化率', '环比', '去年同期转化率', '同比'],
-                    _conv_rows) if _conv_rows else None
-
         db.close()
 
         if month is not None:
@@ -2310,11 +1822,6 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
 
         for idx, biz_type in enumerate(tabs_to_show):
             with tabs[idx]:
-                # 每条业务线独立起算：这三个附表变量在下面的分支里不一定都会赋值，
-                # 若沿用上一条业务线的残留值，导出时会把「旅拍」的附表挂到「婚礼」上。
-                detail_df = pd.DataFrame()
-                salary_df = pd.DataFrame()
-                df_avg = pd.DataFrame()
                 if biz_type == "全部业务":
                     df_biz = df_data
                     total_orders = df_biz['套系数量'].sum()
@@ -2495,7 +2002,6 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                     # 上月同期（环比）
                     lm_avgs = {}
                     lm_divisor_info = {}
-                    lm_divisor_val = {}   # 上月各费用项除数（原始数值，用于环比原因拆分）
                     lm_erxiao_cnt = 0.0
                     lm_wedding_cnt = 0.0
                     lm_area_cnt = 0.0
@@ -2588,7 +2094,6 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                 divisor_label = f"{div_name}: {_fmt_div(divisor)}"
                                 lm_avgs[item] = total_lm / divisor if divisor else 0
                                 lm_divisor_info[item] = divisor_label
-                                lm_divisor_val[item] = divisor
 
                     final_rows = []
                     for idx_row, (item, div_type, div_name) in enumerate(avg_config):
@@ -2619,25 +2124,11 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                 row.extend([f"¥{lm_avg:,.2f}", f"{lm_div_label}", f"{diff_m:+,.2f}", f"{pct_m:+.1f}%"])
                             else:
                                 row.extend(["无数据", "—", "—", "—"])
-                            # 环比原因：把均价环比拆成 费用总额(分子) × 除数(分母)
-                            if lm_avg is not None and lm_avg > 0 and divisor_val:
-                                lm_div_v = lm_divisor_val.get(item, 0)
-                                if lm_div_v:
-                                    num_ratio = (curr_avg * divisor_val) / (lm_avg * lm_div_v) - 1.0
-                                    den_ratio = divisor_val / lm_div_v - 1.0
-                                    row.append(_why_ratio_txt(num_ratio, den_ratio,
-                                                              curr_avg * divisor_val, lm_avg * lm_div_v,
-                                                              divisor_val, lm_div_v,
-                                                              div_name if div_name else '除数'))
-                                else:
-                                    row.append("上月除数为 0，无法拆分原因")
-                            else:
-                                row.append("上月无该项费用，无环比")
                         final_rows.append(row)
 
                     cols = ['费用项', '本期均价', '除数', '去年同期均价', '同比差异', '同比变化']
                     if last_month_start and last_month_end:
-                        cols += ['上月均价', '上月除数', '环比差异', '环比变化', '环比原因']
+                        cols += ['上月均价', '上月除数', '环比差异', '环比变化']
                     df_avg = pd.DataFrame(final_rows, columns=cols)
                     if not can_see:
                         df_avg = mask_dataframe(df_avg)
@@ -2646,9 +2137,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                 # ==================== 拍摄费用明细分析（含同比、环比） ====================
                 st.divider()
                 with st.expander(f"📸 {biz_type}拍摄费用明细分析（含同比）", expanded=False):
-                    st.caption("💡 看表须知：这里的「均价」= 该子项金额 ÷ **真正发生这笔费用的选片订单数**（见「发生订单数」列），"
-                               "没产生这笔费用的订单不再摊入 —— 所以各子项相加不再等于底部总均价（分母不同），"
-                               "但每个数字都回答“这笔费用发生时平均花多少”，同比、环比也不再受订单总量波动干扰。")
+                    st.caption("💡 看表须知：这里的「均价」是把这项费用平摊到当月所有订单上算出来的，没产生这笔费用的订单也算进去了。"
+                               "所以订单变多、发生这笔费用的订单变少，均价都会自然变小 —— 看到涨跌不能直接当成涨价或降价，"
+                               "建议对照页面顶部的订单总数一同判断。")
                     db2 = SessionLocal()
                     if biz_type == "全部业务":
                         # 取 order_id 的同时取 set_name，用于剔除「一纸情书」内部单：
@@ -2704,8 +2195,6 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
 
                     def build_detail_rows(records, order_count):
                         detail_sums = {}
-                        cover_sets = {}   # 每个明细项目「实际发生该费用」的订单集合（去重）
-                        parse_fail = 0
                         for rec in records:
                             if rec.remark and '||解析:' in rec.remark:
                                 parts = rec.remark.split('||解析:')
@@ -2717,13 +2206,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                             try:
                                                 val = float(val_str)
                                                 detail_sums[key] = detail_sums.get(key, 0) + val
-                                                cover_sets.setdefault(key, set()).add(rec.order_id)
-                                            except: parse_fail += 1
+                                            except: pass
                             else:
                                 detail_sums['其他'] = detail_sums.get('其他', 0) + rec.amount
-                                cover_sets.setdefault('其他', set()).add(rec.order_id)
-                        if parse_fail > 0:
-                            st.warning(f"有 {parse_fail} 条拍摄费用明细解析失败已跳过，请核对数据。")
                         total = sum(rec.amount for rec in records)
                         parsed_total = sum(detail_sums.values())
                         if parsed_total != total:
@@ -2733,30 +2218,23 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                             else:
                                 detail_sums['摄化费用'] = diff
                         avg_dict = {k: v / order_count if order_count else 0 for k, v in detail_sums.items()}
-                        cover_cnt = {k: len(cover_sets.get(k, ())) for k in detail_sums}
-                        cover_avg = {k: (detail_sums[k] / cover_cnt[k] if cover_cnt.get(k) else 0.0)
-                                     for k in detail_sums}
-                        return avg_dict, total, cover_cnt, cover_avg
+                        return avg_dict, total
 
-                    curr_detail, curr_total, curr_cover_cnt, curr_cover_avg = build_detail_rows(shoot_records, total_orders)
-                    # 全表统一「发生口径」：底部合计也用 真正有拍摄费用的订单数 作分母，
-                    # 与各子项、与上月/去年合计保持同一分母定义，否则同比环比会自相矛盾。
-                    curr_cov_orders = len({r.order_id for r in shoot_records})
-                    curr_shoot_avg = curr_total / curr_cov_orders if curr_cov_orders else 0
+                    curr_detail, curr_total = build_detail_rows(shoot_records, total_orders)
+                    curr_shoot_avg = curr_total / total_orders if total_orders else 0
 
                     lm_detail, lm_total = {}, 0
-                    lm_cover_cnt, lm_cover_avg = {}, {}
-                    lm_shoot_avg = None
                     if last_month_start and last_month_end:
                         lm_order_count = len(lm_orders) if lm_orders else 0
                         if lm_order_count > 0:
-                            lm_detail, lm_total, lm_cover_cnt, lm_cover_avg = build_detail_rows(lm_shoot_records, lm_order_count)
-                            lm_cov_orders = len({r.order_id for r in lm_shoot_records})
-                            lm_shoot_avg = (lm_total / lm_cov_orders) if lm_cov_orders else None
+                            lm_detail, lm_total = build_detail_rows(lm_shoot_records, lm_order_count)
+                            lm_shoot_avg = lm_total / lm_order_count
+                        else:
+                            lm_shoot_avg = None
+                    else:
+                        lm_shoot_avg = None
 
                     ly_detail, ly_total = {}, 0
-                    ly_cover_cnt, ly_cover_avg = {}, {}
-                    ly_shoot_avg = None
                     ly_order_count = 0
                     if last_year_start.year >= 2025:
                         db3 = SessionLocal()
@@ -2784,40 +2262,36 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                         ).all()
                         ly_order_count = len(ly_order_ids)
                         if ly_order_count > 0:
-                            ly_detail, ly_total, ly_cover_cnt, ly_cover_avg = build_detail_rows(ly_records, ly_order_count)
-                            ly_cov_orders = len({r.order_id for r in ly_records})
-                            ly_shoot_avg = (ly_total / ly_cov_orders) if ly_cov_orders else None
+                            ly_detail, ly_total = build_detail_rows(ly_records, ly_order_count)
+                            ly_shoot_avg = ly_total / ly_order_count
+                        else:
+                            ly_shoot_avg = None
                         db3.close()
+                    else:
+                        ly_shoot_avg = None
 
                     all_keys = sorted(set(list(curr_detail.keys()) + list(lm_detail.keys()) + list(ly_detail.keys())))
                     detail_rows = []
                     for key in all_keys:
-                        cov_n = curr_cover_cnt.get(key, 0)
-                        # 单一口径：均价 = 该子项金额 ÷ 真正发生这笔费用的选片订单数（费用已发生的单）
-                        curr_avg = curr_cover_avg.get(key, 0.0)
-                        ly_avg = ly_cover_avg.get(key, None) if ly_cover_avg.get(key) else None
-                        lm_avg = lm_cover_avg.get(key, None) if lm_cover_avg.get(key) else None
-                        row = [key,
-                               (f"{cov_n:,}" if cov_n else "0"),
-                               (f"¥{curr_avg:,.2f}" if cov_n else "—")]
-                        if ly_avg:
+                        curr_avg = curr_detail.get(key, 0)
+                        ly_avg = ly_detail.get(key, None)
+                        lm_avg = lm_detail.get(key, None)
+                        row = [key, f"¥{curr_avg:,.2f}"]
+                        if ly_avg is not None:
                             diff_ly = curr_avg - ly_avg
-                            pct_ly = diff_ly / ly_avg * 100
+                            pct_ly = diff_ly / ly_avg * 100 if ly_avg else 0
                             row.extend([f"¥{ly_avg:,.2f}", f"{diff_ly:+,.2f}", f"{pct_ly:+.1f}%"])
                         else:
                             row.extend(["无数据", "—", "—"])
-                        if lm_avg:
+                        if lm_avg is not None:
                             diff_lm = curr_avg - lm_avg
-                            pct_lm = diff_lm / lm_avg * 100
+                            pct_lm = diff_lm / lm_avg * 100 if lm_avg else 0
                             row.extend([f"¥{lm_avg:,.2f}", f"{diff_lm:+,.2f}", f"{pct_lm:+.1f}%"])
                         else:
                             row.extend(["无数据", "—", "—"])
                         detail_rows.append(row)
 
-                    # 合计行与各子项同一分母定义：÷ 真正有拍摄费用的订单数
-                    total_row = ['📌 拍摄费用均价（有拍摄费用的单）',
-                                 (f"{curr_cov_orders:,}" if curr_cov_orders else "0"),
-                                 (f"¥{curr_shoot_avg:,.2f}" if curr_cov_orders else "—")]
+                    total_row = ['📌 拍摄费用均价', f"¥{curr_shoot_avg:,.2f}"]
                     if ly_shoot_avg is not None:
                         diff_total_ly = curr_shoot_avg - ly_shoot_avg
                         pct_total_ly = diff_total_ly / ly_shoot_avg * 100 if ly_shoot_avg else 0
@@ -2832,8 +2306,7 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                         total_row.extend(["无数据", "—", "—"])
                     detail_rows.append(total_row)
 
-                    detail_cols = ['明细项目', '发生订单数', '本期均价',
-                                   '去年同期均价', '同比差异', '同比变化',
+                    detail_cols = ['明细项目', '本期均价', '去年同期均价', '同比差异', '同比变化',
                                    '上月均价', '环比差异', '环比变化']
                     detail_df = pd.DataFrame(detail_rows, columns=detail_cols)
                     if not can_see:
@@ -2962,26 +2435,10 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
                                 row.extend([f"¥{lm_avg:,.2f}", f"{diff_lm:+,.2f}", f"{pct_lm:+.1f}%"])
                             else:
                                 row.extend(["无数据", "—", "—"])
-                            # 环比原因：部门均价环比 = 部门工资总额(分子) × 单量(分母)
-                            try:
-                                cur_div_s = order_cnt if promo_mode == 'allocation' else total_orders
-                                lm_div_s = lm_order_cnt if promo_mode == 'allocation' else lm_total_orders
-                            except Exception:
-                                cur_div_s, lm_div_s = 0, 0
-                            if lm_avg is not None and lm_avg > 0 and curr_avg > 0 and cur_div_s and lm_div_s:
-                                num_ratio_s = (curr_avg * cur_div_s) / (lm_avg * lm_div_s) - 1.0
-                                den_ratio_s = cur_div_s / lm_div_s - 1.0
-                                row.append(_why_ratio_txt(num_ratio_s, den_ratio_s,
-                                                          curr_avg * cur_div_s, lm_avg * lm_div_s,
-                                                          cur_div_s, lm_div_s, '单量'))
-                            elif lm_avg is not None:
-                                row.append("上月除数缺失，无法拆分原因")
-                            else:
-                                row.append("上月无该项工资，无环比")
                             rows.append(row)
 
                         labor_cols = ['部门', '本期均价', '去年同期均价', '同比差异', '同比变化',
-                                      '上月均价', '环比差异', '环比变化', '环比原因']
+                                      '上月均价', '环比差异', '环比变化']
                         salary_df = pd.DataFrame(rows, columns=labor_cols)
                         if not can_see:
                             salary_df = mask_dataframe(salary_df)
@@ -3123,14 +2580,10 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
 - 存量员工变动影响占总变化：**{abs(total_staying) / abs(r['total_change']) * 100 if r['total_change'] else 0:.1f}%**
 """)
 
-                # 保存当前业务类型的 DataFrames 供导出使用。
-                # key 里带「期间 + 费用口径」，两个口径各存一份、互不覆盖：
-                # 用户在页面上把口径切换看过一次后，导出即可一次性带齐两套附表
-                # （见导出段 _ex_a / _ex_b），不必再导第二个文件。
-                _sig = f"{period_start:%Y%m%d}-{period_end:%Y%m%d}"
-                st.session_state[f'avg_df__{biz_type}__{_sig}__{promo_mode}'] = df_avg
-                st.session_state[f'detail_df__{biz_type}__{_sig}__{promo_mode}'] = detail_df
-                st.session_state[f'salary_df__{biz_type}__{_sig}__{promo_mode}'] = salary_df
+                # 保存当前业务类型的 DataFrames 供导出使用
+                st.session_state[f'avg_df_{biz_type}'] = df_avg
+                st.session_state[f'detail_df_{biz_type}'] = detail_df if 'detail_df' in locals() else pd.DataFrame()
+                st.session_state[f'salary_df_{biz_type}'] = salary_df if 'salary_df' in locals() else pd.DataFrame()
 
     # ==================== 转化率展示区块（毛客数 ÷ 订单数） ====================
     st.divider()
@@ -3284,22 +2737,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
     report_data_json = json.dumps(report_payload, ensure_ascii=False)
     json.loads(report_data_json)  # 自检：确保序列化结果无 NaN/NaT 非法字面量
 
-    # 附表（费用明细 / 人工部门 / 均价）按「期间 + 业务范围 + 口径」缓存。
-    # 两个口径各取一份：当前口径 + 另一口径（后者只要用户在本次会话里把口径切换
-    # 看过一次，就已经算好并存在 session 里），从而实现「一次导出，两个口径附表都齐」。
-    _sig_x = f"{period_start:%Y%m%d}-{period_end:%Y%m%d}"
-    _cur_mode = promo_mode
-    _oth_mode = 'allocation' if promo_mode == 'actual' else 'actual'
-
-    def _get_extra_dfs(_mode):
-        return (
-            st.session_state.get(f'avg_df__{export_biz_type}__{_sig_x}__{_mode}', pd.DataFrame()),
-            st.session_state.get(f'detail_df__{export_biz_type}__{_sig_x}__{_mode}', pd.DataFrame()),
-            st.session_state.get(f'salary_df__{export_biz_type}__{_sig_x}__{_mode}', pd.DataFrame()),
-        )
-
-    avg_df, detail_df, salary_df = _get_extra_dfs(_cur_mode)
-    avg_df_o, detail_df_o, salary_df_o = _get_extra_dfs(_oth_mode)
+    avg_df = st.session_state.get(f'avg_df_{export_biz_type}', pd.DataFrame())
+    detail_df = st.session_state.get(f'detail_df_{export_biz_type}', pd.DataFrame())
+    salary_df = st.session_state.get(f'salary_df_{export_biz_type}', pd.DataFrame())
 
     def df_to_html_rows(df, columns):
         if df is None or df.empty:
@@ -3354,12 +2794,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
     avg_columns = ['费用项', '本期均价', '除数', '去年同期均价', '同比差异', '同比变化']
     if last_month_start and last_month_end:
         avg_columns += ['上月均价', '上月除数', '环比差异', '环比变化']
-    if '环比原因' in avg_df.columns:
-        avg_columns.append('环比原因')
     avg_table_html = df_to_html_rows(avg_df, avg_columns)
 
-    shoot_columns = ['明细项目', '发生订单数', '本期均价']
-    shoot_columns += ['去年同期均价', '同比差异', '同比变化']
+    shoot_columns = ['明细项目', '本期均价', '去年同期均价', '同比差异', '同比变化']
     if last_month_start and last_month_end:
         shoot_columns += ['上月均价', '环比差异', '环比变化']
     shoot_table_html = df_to_html_rows(detail_df, shoot_columns)
@@ -3367,8 +2804,6 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
     labor_columns = ['部门', '本期均价', '去年同期均价', '同比差异', '同比变化']
     if last_month_start and last_month_end:
         labor_columns += ['上月均价', '环比差异', '环比变化']
-    if '环比原因' in salary_df.columns:
-        labor_columns.append('环比原因')
     labor_table_html = df_to_html_rows(salary_df, labor_columns)
 
     # ==================== 交互式 Plotly 图表（HTML + CDN，无需服务器安装字体） ====================
@@ -3490,207 +2925,9 @@ def _render_profit_report(period_start, period_end, filter_option, period_month,
         mime="text/html"
     )
 
-    # ==================== 经营利润汇报（双口径 · 可切换 · 含同比/环比/均价） ====================
-    # 纯展示层：复用上面已算好的本期两口径 DataFrame，另取「上月」「去年同期」两期数据，
-    # 交给 dual_report_v3 渲染成单文件 HTML（右上角切换口径，打印自动展开）。
-    st.divider()
-    st.subheader("📊 经营利润汇报（可切换口径 · 含同比 / 环比 / 均价）")
-    st.caption(
-        "面向汇报的**单文件 HTML**：右上角一键切换「实际口径 / 分摊口径 / 两口径对照」，"
-        "并把同比（去年同期）、环比（上月）、均价与费用 / 人工 / 均价三个分析块合并到一份里。"
-        "　给销售部做经营分析用分摊口径，给股东、财务对账用实际口径。"
-    )
-
-    # 日期基准（防御性取值：上游按「按月 / 多月」分支分别赋值，缺失时自行兜底）
-    _lms = locals().get('last_month_start')
-    _lme = locals().get('last_month_end')
-    _lys = locals().get('last_year_start') or _shift_year_date(period_start)
-    _lye = locals().get('last_year_end') or _shift_year_date(period_end)
-
-    with st.spinner("正在汇总环比（上月）与同比（去年同期）数据…"):
-        _brief_prev, _brief_yoy = {}, {}
-        for _m in ('actual', 'allocation'):
-            _d = None
-            if _lms and _lme:
-                _d = _apply_filter(generate_profit_report(
-                    _lms.strftime('%Y-%m-%d'),
-                    _lme.strftime('%Y-%m-%d'), _m), filter_option)
-            _brief_prev[_m] = _d
-            _brief_yoy[_m] = _yoy_pack_from_df(_apply_filter(generate_profit_report(
-                _lys.strftime('%Y-%m-%d'),
-                _lye.strftime('%Y-%m-%d'), _m), filter_option))
-
-    # ---- 同比数据源：数据库优先；库内没有去年同期订单时，可上传历史年度汇总表补全
-    _yoy_from_upload = False
-    if not (_brief_yoy['actual'] or _brief_yoy['allocation']):
-        st.info(
-            f"系统数据库中未查到去年同期（{_lys.strftime('%Y-%m-%d')} ~ "
-            f"{_lye.strftime('%Y-%m-%d')}）的订单数据，同比列将显示「—」。"
-            "如需补全同比，请上传该年度的《旅拍利润全年-汇总》与《婚礼利润全年-汇总》（.xlsx）。"
-        )
-        _uc1, _uc2 = st.columns(2)
-        _uf1 = _uc1.file_uploader('旅拍利润全年-汇总.xlsx', type=['xlsx', 'xls'], key='yoy_up_travel')
-        _uf2 = _uc2.file_uploader('婚礼利润全年-汇总.xlsx', type=['xlsx', 'xls'], key='yoy_up_wedding')
-        if _uf1 or _uf2:
-            with st.spinner("正在解析历史汇总表…"):
-                _hist = hist_yoy.load_from_files([_uf1, _uf2])
-                _ly_months = _period_months(_lys, _lye)
-                for _m in ('actual', 'allocation'):
-                    _brief_yoy[_m] = {
-                        'all': hist_yoy.sum_months(_hist, _ly_months, _m),
-                        '旅拍': hist_yoy.sum_months(_hist, _ly_months, _m, '旅拍'),
-                        '婚礼': hist_yoy.sum_months(_hist, _ly_months, _m, '婚礼'),
-                    }
-                _yoy_from_upload = True
-
-    # ---- 附录：把系统已算好的三个分析块（费用明细 / 人工部门 / 均价）转成汇报的附表
-    # 两个口径各生成一套：当前口径用本次页面算好的；另一口径用会话里缓存的那套。
-    # 两边都齐 → 一个文件带齐两套附表，不用再导第二份。
-    # ---- 附录：运营成本（business_type='运营'，账号存在 cost_item 字段，与口径无关）
-    # 运营成本是「按账号投放/运营」的期间费用，不进利润表的 13 项成本口径，
-    # 但老板看汇报时要能一眼看到总额与环比，所以单列一张附表。
-    def _ops_sum(_s, _e):
-        if not _s or not _e:
-            return {}
-        _ms = _period_months(_s, _e)
-        if not _ms:
-            return {}
-        _db = SessionLocal()
-        try:
-            _rows = (_db.query(IndirectCost.cost_item, func.sum(IndirectCost.amount))
-                        .filter(IndirectCost.business_type == '运营',
-                                IndirectCost.period.in_(_ms))
-                        .group_by(IndirectCost.cost_item).all())
-            _out = {}
-            for _k, _v in _rows:
-                _name = _ops_account(_k)          # 别名归并：同一账号不同写法相加
-                _out[_name] = _out.get(_name, 0.0) + float(_v or 0)
-            return _out
-        except Exception:
-            return {}
-        finally:
-            _db.close()
-
-    def _fy(v):
-        return f"¥{v:,.0f}" if v else "—"
-
-    def _dchg(cur_v, base_v):
-        if not base_v:
-            return "—"
-        d = cur_v - base_v
-        return f"{d:+,.0f}（{d / base_v:+.1%}）"
-
-    _ops_cur = _ops_sum(period_start, period_end)
-    _ops_prev = _ops_sum(_lms, _lme)
-    _ops_ly = _ops_sum(_lys, _lye)
-    ops_tbl = None
-    if _ops_cur or _ops_prev or _ops_ly:
-        _ops_keys = sorted(set(_ops_cur) | set(_ops_prev) | set(_ops_ly),
-                           key=lambda k: -_ops_cur.get(k, 0.0))
-        _orows = [[_k,
-                   _fy(_ops_cur.get(_k, 0.0)), _fy(_ops_prev.get(_k, 0.0)),
-                   _dchg(_ops_cur.get(_k, 0.0), _ops_prev.get(_k, 0.0)),
-                   _fy(_ops_ly.get(_k, 0.0)),
-                   _dchg(_ops_cur.get(_k, 0.0), _ops_ly.get(_k, 0.0))]
-                  for _k in _ops_keys]
-        _o_c, _o_p, _o_l = sum(_ops_cur.values()), sum(_ops_prev.values()), sum(_ops_ly.values())
-        _orows.append(['合计', _fy(_o_c), _fy(_o_p), _dchg(_o_c, _o_p),
-                       _fy(_o_l), _dchg(_o_c, _o_l)])
-        ops_tbl = ('🏢 运营成本（按账号，含环比同比）',
-                   ['账号', '本期', '上月', '环比', '去年同期', '同比'], _orows)
-
-    def _build_extras(_avg, _detail, _salary):
-        return [x for x in (
-            _extra_rows(_detail, shoot_columns, '📸 拍摄费用明细分析（含同比）'),
-            _extra_rows(_salary, labor_columns, '💼 人工成本分析（部门均价同比）'),
-            _extra_rows(_avg, avg_columns, '📈 均价及同比环比分析'),
-        ) if x]
-
-    # 转化率 / 运营成本与费用口径无关，两个视图都挂同一份
-    _shared_extras = [x for x in (conv_tbl, ops_tbl) if x]
-
-    _ex_cur = _build_extras(avg_df, detail_df, salary_df)
-    _ex_oth = _build_extras(avg_df_o, detail_df_o, salary_df_o)
-
-    _other_name = '实际口径' if promo_mode == 'allocation' else '分摊口径'
-    _notice_other = ('__notice__',
-                     f"本视图的费用与均价明细尚未计算：本次导出时「{_other_name}」还不在会话缓存里。"
-                     f"左侧「费用口径」切到「{_other_name}」看一眼（页面会自动算好并缓存），"
-                     f"再切回来导出，这一个文件里两个口径的附表就都齐了，无需再导第二份。", [])
-
-    def _pick_extras(_own, _fallback_notice):
-        # 注意：要按「分析表是否存在」判断，不能按整个 extra 列表是否为空判断
-        # —— 转化率 / 运营成本是常驻的，否则另一口径缺附表时的提示卡会被它们挤掉。
-        return (_own if _own else [_fallback_notice]) + _shared_extras
-
-    if promo_mode == 'actual':
-        _extra_map = {'a': _pick_extras(_ex_cur, _notice_other),
-                      'b': _pick_extras(_ex_oth, _notice_other)}
-    else:
-        _extra_map = {'a': _pick_extras(_ex_oth, _notice_other),
-                      'b': _pick_extras(_ex_cur, _notice_other)}
-
-    _yoy_label = (_lys.strftime('%Y-%m')
-                  if (_lys.year == _lye.year and _lys.month == _lye.month)
-                  else f"{_lys.strftime('%Y-%m')} ~ {_lye.strftime('%Y-%m')}")
-    _seg_label = {'全部': '全部业务', '仅旅拍': '旅拍', '仅婚礼': '婚礼', '仅新疆地区': '新疆'}.get(
-        filter_option, '全部业务')
-
-    # ---- 业务线分段：旅拍 / 婚礼 / 新疆 三块并列，各自一份完整报表
-    # 口径互斥且合计＝全量：新疆按套系名含「新疆」切（跨旅拍、婚礼两条业务线），
-    # 旅拍、婚礼各自再剔除新疆套系，避免重复计算。
-    _SEG_DEF_ALL = [
-        {'key': 'travel', 'name': '旅拍', 'kind': 'equal', 'value': '旅拍', 'exclude_like': '新疆'},
-        {'key': 'wedding', 'name': '婚礼', 'kind': 'equal', 'value': '婚礼', 'exclude_like': '新疆'},
-        {'key': 'xinjiang', 'name': '新疆', 'kind': 'set_like', 'value': '新疆'},
-    ]
-    _single_biz = filter_option in ('仅旅拍', '仅婚礼', '仅新疆地区')
-    if _single_biz:
-        _brief_segments = None      # 单一业务线：报表本身已只含该线，无需再分段
-    else:
-        _brief_segments = []
-        for _sd in _SEG_DEF_ALL:
-            _sg = dict(_sd)
-            if _sd['key'] == 'xinjiang' or not (_brief_yoy['actual'] or _brief_yoy['allocation']):
-                # 新疆在历史汇总表里没有单列；历史表缺失时同比整体留空
-                _sg['yoy_a'] = _sg['yoy_b'] = None
-            else:
-                _nm = _sd['name']
-                _ya = (_brief_yoy['actual'] or {}).get(_nm)
-                _yb = (_brief_yoy['allocation'] or {}).get(_nm)
-                _sg['yoy_a'] = {'all': _ya, _nm: _ya} if _ya else None
-                _sg['yoy_b'] = {'all': _yb, _nm: _yb} if _yb else None
-            _brief_segments.append(_sg)
-
-    _brief_html = render_brief_report(
-        actual_df, allocation_df,
-        _brief_prev['actual'], _brief_prev['allocation'],
-        _brief_yoy['actual'], _brief_yoy['allocation'],
-        {
-            'span': period_month or f"{period_start} ~ {period_end}",
-            'biz': _seg_label,
-            'prev_label': _lms.strftime('%Y-%m') if _lms else '—',
-            'yoy_label': _yoy_label,
-            'gen': datetime.now().strftime('%Y-%m-%d %H:%M'),
-            'yoy_src': '上传的历史年度汇总表' if _yoy_from_upload else '去年同期报表（数据库）',
-        },
-        extra=_extra_map,
-        segments=_brief_segments,
-    )
-
-    st.download_button(
-        label="📥 下载经营利润汇报（口径可切换）",
-        data=_brief_html,
-        file_name=f"经营利润汇报_{period_month}_{filter_option}_{promo_mode_label}.html",
-        mime="text/html",
-        key='dl_brief_report',
-    )
-    with st.expander("👀 在线预览（点报表右上角可切换口径）", expanded=False):
-        components.html(_brief_html, height=1000, scrolling=True)
-
     add_log(st.session_state.user_id, st.session_state.username, "生成利润表", f"月份:{period_month}")
-    period_mode_str = "按月"
-    filter_label = filter_option
+    period_mode_str = "按月" if month is not None else "按月"
+    filter_label = filter_option if filter_option != "全部" else "全部"
     # 快照期间标签：period_month 已经是正确的展示标签
     #   - 单月模式：'2026-08'
     #   - 多月模式：'2026年1月-2026年8月'
@@ -3879,7 +3116,7 @@ def import_income_page():
             handle_dup = st.radio("重复处理", [
                 "覆盖已有记录",
                 "仅导入新记录（跳过已有）"
-            ], key="dup_income")
+            ])
         else:
             handle_dup = "仅导入新记录"
 
@@ -3935,11 +3172,6 @@ def import_income_page():
                 st.success(msg)
                 add_log(st.session_state.user_id, st.session_state.username, "导入收入数据",
                         f"新{import_count}条, 更新{update_count}条" if can_see else "导入收入数据")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入出错：{e}")
@@ -3956,16 +3188,14 @@ def maintain_std_cost_page():
         **常见费用项：** `工厂费用`, `微电影剪辑费`, `修片单价`, `拍摄费用` 等
         """)
     db = SessionLocal()
-    try:
-        costs = db.query(SetStandardCost).all()
-        if costs:
-            df_costs = pd.DataFrame([{'套系':c.set_name,'费用项':c.cost_item,'金额':c.amount} for c in costs])
-            if can_see:
-                st.write("当前数据：", df_costs)
-            else:
-                st.write("当前数据：", mask_dataframe(df_costs))
-    finally:
-        db.close()
+    costs = db.query(SetStandardCost).all()
+    if costs:
+        df_costs = pd.DataFrame([{'套系':c.set_name,'费用项':c.cost_item,'金额':c.amount} for c in costs])
+        if can_see:
+            st.write("当前数据：", df_costs)
+        else:
+            st.write("当前数据：", mask_dataframe(df_costs))
+    db.close()
     uploaded = st.file_uploader("上传标准成本Excel", type="xlsx")
     if uploaded:
         df = pd.read_excel(uploaded)
@@ -3973,7 +3203,7 @@ def maintain_std_cost_page():
             st.write(df.head())
         else:
             st.write(mask_dataframe(df.head()))
-        if st.button("替换全部标准成本", disabled=(st.session_state.role != 'admin')):
+        if st.button("替换全部标准成本"):
             db = SessionLocal()
             try:
                 db.query(SetStandardCost).delete()
@@ -3983,17 +3213,11 @@ def maintain_std_cost_page():
                 msg = f"标准成本已更新" if can_see else "标准成本已更新（数量已隐藏）"
                 st.success(msg)
                 add_log(st.session_state.user_id, st.session_state.username, "维护标准成本", f"更新{len(df)}条" if can_see else "更新***条")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"错误：{e}")
             finally:
                 db.close()
-        st.caption("⚠️ 仅管理员可执行")
 
 def import_operation_cost_page():
     st.markdown("### 📊 导入运营成本")
@@ -4038,16 +3262,8 @@ def import_operation_cost_page():
         if st.button("确认导入运营成本"):
             db = SessionLocal()
             try:
-                # ⚠️ 只清空「本次文件涉及的那几个月」，不能像旧代码那样
-                # `filter_by(business_type='运营').delete()` —— 那会把**其他所有月份**
-                # 的运营成本一并删掉，而页面说明写的是「重复导入同一个月会覆盖该月」，
-                # 行为与说明不符，且是静默丢数。
-                _periods_in_file = [p for p in pd.unique(records['年月']) if p]
-                if _periods_in_file:
-                    db.query(IndirectCost).filter(
-                        IndirectCost.business_type == '运营',
-                        IndirectCost.period.in_(list(_periods_in_file))
-                    ).delete(synchronize_session=False)
+                # 删除所有 business_type='运营' 的旧记录
+                db.query(IndirectCost).filter_by(business_type='运营').delete()
                 for _, row in records.iterrows():
                     db.add(IndirectCost(
     period=row['年月'],
@@ -4059,11 +3275,6 @@ def import_operation_cost_page():
                 msg = f"成功导入 {len(records)} 条运营成本记录" if can_see else "成功导入 *** 条"
                 st.success(msg)
                 add_log(st.session_state.user_id, st.session_state.username, "导入运营成本", f"共{len(records)}条" if can_see else "导入运营成本")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -4091,10 +3302,9 @@ def operation_cost_query_page():
         if records:
             df = pd.DataFrame([{
                 '年月': r.period,
-                '账号': _ops_account(r.cost_item),  # 别名归并：同一账号不同写法统一显示
+                '账号': r.cost_item,  # 注意：我们将账号存在 cost_item 字段
                 '金额': r.amount
             } for r in records])
-            df = df.groupby(['年月', '账号'], as_index=False)['金额'].sum()
             if can_see:
                 st.dataframe(df, width='stretch')
             else:
@@ -4144,7 +3354,6 @@ def import_actual_cost_page():
             "像素蛋糕费用": "像素蛋糕修图费", "像素蛋糕": "像素蛋糕修图费",
             "门店二销款": "二销选片费", "门店二销款结算费": "二销选片费",
         }
-        parse_fail_count = 0
         if is_wide:
             retouch_cols = [c for c in df.columns if "修片费" in c and "微电影" not in c]
             col_mapping = {}
@@ -4169,7 +3378,7 @@ def import_actual_cost_page():
                                     st.warning(f"订单 {oid} 的「拍摄费用」已跳过，请使用「📸 拍摄账单导入」处理。")
                                     continue
                                 records.append((oid, std_name, amount))
-                        except ValueError: parse_fail_count += 1
+                        except ValueError: pass
         else:
             if "订单号" not in df.columns or "费用项" not in df.columns or "金额" not in df.columns:
                 st.error("需要订单号、费用项、金额三列")
@@ -4179,15 +3388,13 @@ def import_actual_cost_page():
                 raw_item = str(row['费用项']).strip()
                 std_item = NAME_MAP.get(raw_item, raw_item)
                 try: amt = float(row['金额'])
-                except: parse_fail_count += 1; continue
+                except: continue
                 if amt != 0:
                     if std_item == '拍摄费用':
                         st.warning(f"订单 {oid} 的「拍摄费用」已跳过，请使用「📸 拍摄账单导入」处理。")
                         continue
                     records.append((oid, std_item, amt))
 
-        if parse_fail_count > 0:
-            st.warning(f"有 {parse_fail_count} 条实际成本金额解析失败已跳过，请核对数据。")
         if not records and not retouch_updates:
             st.warning("没有有效数据")
             return
@@ -4195,17 +3402,11 @@ def import_actual_cost_page():
         try:
             oids = list({r[0] for r in records})
             items = list({r[1] for r in records})
-            _overwritten = 0
             if oids and items:
-                # ⚠️ 只覆盖「同一订单同一费用项」的普通记录，且**不动「自租场地消耗」写进来的
-                # 场地记录**：那是另一笔独立成本（交付场地费 + 自租消耗），本页无差别删除
-                # 会把它一起抹掉，且这里没有「覆盖/合并」选项，用户完全无感。
                 existing_rows = db.query(ActualDirectCost).filter(
                     ActualDirectCost.order_id.in_(oids),
-                    ActualDirectCost.cost_item.in_(items),
-                    or_(ActualDirectCost.remark.is_(None), ActualDirectCost.remark != '自租场地')
+                    ActualDirectCost.cost_item.in_(items)
                 ).all()
-                _overwritten = len(existing_rows)
                 for row in existing_rows:
                     db.delete(row)
             for oid, item, amt in records:
@@ -4215,18 +3416,9 @@ def import_actual_cost_page():
                 if order: order.actual_retouch_fee = fee
                 else: db.add(Order(order_id=oid, actual_retouch_fee=fee))
             db.commit()
-            msg = (f"成功导入/更新 {len(records)} 条成本记录（覆盖原有 {_overwritten} 条），"
-                   f"修片费更新 {len(retouch_updates)} 个订单") if can_see else \
-                "成功导入/更新 *** 条成本记录，修片费更新 *** 个订单"
+            msg = f"成功导入/更新 {len(records)} 条成本记录，修片费更新 {len(retouch_updates)} 个订单" if can_see else "成功导入/更新 *** 条成本记录，修片费更新 *** 个订单"
             st.success(msg)
-            if can_see and _overwritten:
-                st.caption("说明：被覆盖的只是同订单同费用项的旧记录；「🏟️ 自租场地消耗」导入的场地记录不受影响。")
             add_log(st.session_state.user_id, st.session_state.username, "导入实际成本", f"成本{len(records)}条" if can_see else "成本***条")
-            try:
-                from profit_engine import clear_profit_cache
-                clear_profit_cache()
-            except Exception:
-                pass
         except Exception as e:
             db.rollback()
             st.error(f"导入失败：{e}")
@@ -4316,9 +3508,7 @@ def indirect_cost_page():
             else:
                 key = (r.cost_item, r.business_type)
                 saved[key] = r.amount
-    except:
-        st.error("读取该月已存费用失败，为避免误覆盖已中止。请刷新重试；若持续失败请联系管理员。")
-        st.stop()
+    except: pass
     finally: db.close()
 
     if not can_see:
@@ -4327,41 +3517,28 @@ def indirect_cost_page():
     with st.expander("📤 工资批量导入（年月-部门-旅拍-婚礼，可多期）", expanded=False):
         st.markdown("""
         **文件格式**：列名必须为 `年月`、`部门`、`旅拍`、`婚礼`  
-        部门如：策划部、销售部等，系统将自动加上“工资”后缀存储。  
-        ⚠️ 系统认可的工资部门为：**策划部 / 销售部 / 运营部 / 综合部 / 总经办 / 售后服务 / AI与数据中心 / 视频剪辑部**；
-        其它名称的部门**不会计入人工成本**，请先确认部门名称。
+        部门如：策划部、销售部等，系统将自动加上“工资”后缀存储。
         """)
         uploaded_salary = st.file_uploader("上传工资Excel", type="xlsx", key="salary_upload")
         if uploaded_salary:
             df_s = pd.read_excel(uploaded_salary)
-            # 容错：列名/部门名去掉前后空格（Excel 里极易带上，会导致匹配失败）
-            df_s.columns = [str(c).strip() for c in df_s.columns]
-            # 期间列归一化：同一列可能混有「日期」与「数字(Excel序列号)」，不统一会让分组报错
-            if '年月' in df_s.columns:
-                df_s['年月'] = df_s['年月'].map(standardize_period)
             if can_see:
                 st.write("预览：", df_s.head())
             else:
                 st.write("预览：", mask_dataframe(df_s.head()))
             if all(c in df_s.columns for c in ['年月', '部门', '旅拍', '婚礼']):
-                unknown = sorted({str(d).strip() for d in df_s['部门'].dropna().unique()
-                                  if str(d).strip() and str(d).strip() not in SALARY_DEPTS})
-                if unknown:
-                    st.warning("⚠️ 以下部门系统不认可，导入后**不会计入人工成本**，请先确认：「"
-                               + "」「".join(unknown) + "」。认可的部门为：" + " / ".join(SALARY_DEPTS), icon="⚠️")
                 if st.button("导入工资（多期）"):
                     db = SessionLocal()
                     try:
-                        df_s['部门'] = df_s['部门'].astype(str).str.strip()
                         grouped = df_s.groupby(['年月', '部门']).agg({'旅拍': 'sum', '婚礼': 'sum'}).reset_index()
                         for _, row in grouped.iterrows():
                             p = standardize_period(row['年月'])
-                            dept = str(row['部门']).strip() + '工资'
+                            dept = str(row['部门']) + '工资'
                             db.query(IndirectCost).filter_by(period=p, cost_item=dept).delete()
                         db.commit()
                         for _, row in grouped.iterrows():
                             p = standardize_period(row['年月'])
-                            dept = str(row['部门']).strip() + '工资'
+                            dept = str(row['部门']) + '工资'
                             travel_amt = float(row['旅拍']) if pd.notna(row['旅拍']) else 0
                             wedding_amt = float(row['婚礼']) if pd.notna(row['婚礼']) else 0
                             for bt, amt in [('旅拍', travel_amt), ('婚礼', wedding_amt)]:
@@ -4370,26 +3547,17 @@ def indirect_cost_page():
                         db.commit()
                         msg = "工资批量导入成功！" if can_see else "工资批量导入成功（数量已隐藏）"
                         st.success(msg)
-                        try:
-                            from profit_engine import clear_profit_cache
-                            clear_profit_cache()
-                        except Exception:
-                            pass
                         st.rerun()
                     except Exception as e:
                         db.rollback(); st.error(f"导入失败：{e}")
                     finally: db.close()
             else:
                 st.error("缺少必要列：年月、部门、旅拍、婚礼")
-        else:
-            st.caption("提示：文件上传完成后，**本框下方**会依次出现「预览」表格和 **导入工资（多期）** 按钮，"
-                       "请稍等 2~3 秒（页面会自动刷新）再向下查看。")
 
     with st.expander("📤 间接费用批量导入（期间-业务类型-费用项-金额，可多期）", expanded=False):
         st.markdown("""
         **文件格式**：必须包含列 `期间`、`业务类型`（旅拍/婚礼）、`费用项`、`金额`  
-        费用项可使用：`房租、水电、办公费等`、`税费及手续费`、`样片研发`、`场地铺设费`、`舆情处理` 等。  
-        💡 **银行结息等收入请填负数冲减**：如结息记在「税费及手续费」里，金额填「手续费支出 − 结息收入」的净额；结息大于手续费时直接填负数，报表里这项会变成负成本、利润相应增加。同一期间+费用项+业务类型重新导入会覆盖旧值。
+        费用项可使用：`房租、水电、办公费等`、`税费及手续费`、`样片研发`、`场地铺设费`、`舆情处理` 等。
         """)
         st.warning(
             "**「样片研发」只填新疆以外的拍样费用。** "
@@ -4402,9 +3570,6 @@ def indirect_cost_page():
         uploaded_indirect = st.file_uploader("上传间接费用Excel", type="xlsx", key="indirect_upload")
         if uploaded_indirect:
             df_i = pd.read_excel(uploaded_indirect)
-            df_i.columns = [str(c).strip() for c in df_i.columns]
-            if '期间' in df_i.columns:
-                df_i['期间'] = df_i['期间'].map(standardize_period)
             if can_see:
                 st.write("预览：", df_i.head())
             else:
@@ -4414,45 +3579,23 @@ def indirect_cost_page():
                 if st.button("导入间接费用（多期）"):
                     db = SessionLocal()
                     try:
-                        # 第一步：先校验、再落库。绝不「先删除后丢弃」，避免静默丢数据。
-                        _rows_ok, _rows_bad = [], []
                         for _, row in df_i.iterrows():
                             p = standardize_period(row['期间'])
-                            bt = str(row['业务类型']).strip()
-                            item = str(row['费用项']).strip()
-                            amt = float(row['金额'])
-                            if bt in ('旅拍', '婚礼'):
-                                _rows_ok.append((p, bt, item, amt))
-                            elif bt == '新疆' and item in ('新疆拍样费用', '新疆报销费用'):
-                                # 新疆专项费用允许从本页一并导入，引擎会合并进「样片研发」列
-                                _rows_ok.append((p, '新疆', item, amt))
-                            else:
-                                _rows_bad.append(f"{p}｜{bt}｜{item}｜¥{amt:,.2f}")
-                        for p, bt, item, amt in _rows_ok:
+                            bt = str(row['业务类型'])
+                            item = str(row['费用项'])
                             db.query(IndirectCost).filter_by(period=p, cost_item=item, business_type=bt).delete()
                         db.commit()
-                        for p, bt, item, amt in _rows_ok:
+                        for _, row in df_i.iterrows():
+                            p = standardize_period(row['期间'])
+                            bt = str(row['业务类型'])
+                            item = str(row['费用项'])
+                            amt = float(row['金额'])
+                            if bt not in ('旅拍', '婚礼'): continue
                             db.add(IndirectCost(period=p, cost_item=item, business_type=bt, amount=amt))
                         db.commit()
-                        if _rows_ok:
-                            st.success(f"间接费用批量导入成功！共 {len(_rows_ok)} 条" if can_see
-                                       else "间接费用批量导入成功（数量已隐藏）")
-                        if _rows_bad:
-                            st.error(
-                                f"有 {len(_rows_bad)} 行**没有导入**（业务类型无法识别）：\n\n"
-                                + "\n".join(f"- {x}" for x in _rows_bad[:20])
-                                + (f"\n- ……共 {len(_rows_bad)} 行" if len(_rows_bad) > 20 else "")
-                                + "\n\n业务类型只能是「旅拍」或「婚礼」；"
-                                  "新疆拍样/报销请填「新疆」且费用项为「新疆拍样费用」或「新疆报销费用」，"
-                                  "或改用「🏜️ 新疆拍样/报销费用」页导入。"
-                            )
-                        if not _rows_bad:
-                            try:
-                                from profit_engine import clear_profit_cache
-                                clear_profit_cache()
-                            except Exception:
-                                pass
-                            st.rerun()
+                        msg = "间接费用批量导入成功！" if can_see else "间接费用批量导入成功（数量已隐藏）"
+                        st.success(msg)
+                        st.rerun()
                     except Exception as e:
                         db.rollback(); st.error(f"导入失败：{e}")
                     finally: db.close()
@@ -4462,28 +3605,25 @@ def indirect_cost_page():
     st.subheader("旅拍 & 婚礼 分项间接费用")
     st.caption(
         "⚠️ **「样片研发」只填新疆以外的拍样费用**；新疆拍样费用请走「🏜️ 新疆拍样/报销费用」单独导入。")
-    cost_items = [d + '工资' for d in SALARY_DEPTS] + [
-        '房租、水电、办公费等', '税费及手续费', '样片研发', '场地铺设费', '舆情处理']
-    # 这 5 个间接费用项允许负数（银行结息等收入以负数冲减，如结息记在「税费及手续费」）
-    _NEG_OK = {'房租、水电、办公费等', '税费及手续费', '样片研发', '场地铺设费', '舆情处理'}
+    cost_items = ['策划部工资','销售部工资','运营部工资','综合部工资','总经办工资',
+                  '售后服务工资','AI与数据中心工资','房租、水电、办公费等','税费及手续费',
+                  '样片研发','场地铺设费','舆情处理']
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("#### 📸 旅拍")
-        travel_vals = {item: st.number_input(f"{item}", min_value=(None if item in _NEG_OK else 0.0), value=saved.get((item, '旅拍'), 0.0), step=100.0, key=f"t_{item}", disabled=not can_see) for item in cost_items}
+        travel_vals = {item: st.number_input(f"{item}", min_value=0.0, value=saved.get((item, '旅拍'), 0.0), step=100.0, key=f"t_{item}", disabled=not can_see) for item in cost_items}
     with col2:
         st.markdown("#### 💒 婚礼")
-        wedding_vals = {item: st.number_input(f"{item}", min_value=(None if item in _NEG_OK else 0.0), value=saved.get((item, '婚礼'), 0.0), step=100.0, key=f"w_{item}", disabled=not can_see) for item in cost_items}
+        wedding_vals = {item: st.number_input(f"{item}", min_value=0.0, value=saved.get((item, '婚礼'), 0.0), step=100.0, key=f"w_{item}", disabled=not can_see) for item in cost_items}
     st.divider()
     st.subheader("📢 推广费（总额，系统按加权订单数自动拆分）")
     promo_total = st.number_input("推广费总额", min_value=0.0, value=float(saved.get('travel_promo',0)+saved.get('wedding_promo',0)), step=100.0, key="promo_total", disabled=not can_see)
     db = SessionLocal()
-    try:
-        ratio_rule = db.query(AllocationRule).filter_by(rule_type='promotion_wedding_ratio').first()
-        wedding_ratio = float(ratio_rule.param1) if ratio_rule else 1.0
-        stats_travel = db.query(MonthlyStats).filter_by(period=period, business_type='旅拍').first()
-        stats_wedding = db.query(MonthlyStats).filter_by(period=period, business_type='婚礼').first()
-    finally:
-        db.close()
+    ratio_rule = db.query(AllocationRule).filter_by(rule_type='promotion_wedding_ratio').first()
+    wedding_ratio = float(ratio_rule.param1) if ratio_rule else 1.0
+    stats_travel = db.query(MonthlyStats).filter_by(period=period, business_type='旅拍').first()
+    stats_wedding = db.query(MonthlyStats).filter_by(period=period, business_type='婚礼').first()
+    db.close()
     if stats_travel and stats_wedding:
         t_orders = stats_travel.order_count
         w_orders = stats_wedding.order_count
@@ -4499,10 +3639,8 @@ def indirect_cost_page():
     else:
         st.warning("请先在「📊 录入月度基础数据」中录入本月的订单数，以便自动拆分推广费。")
     db = SessionLocal()
-    try:
-        existing = db.query(IndirectCost).filter_by(period=period).all()
-    finally:
-        db.close()
+    existing = db.query(IndirectCost).filter_by(period=period).all()
+    db.close()
     if existing:
         st.subheader("📋 本月已保存的间接费用记录")
         df_exist = pd.DataFrame([{'费用项': e.cost_item, '业务类型': e.business_type or '推广费', '金额': e.amount} for e in existing])
@@ -4532,11 +3670,6 @@ def indirect_cost_page():
                         db.add(IndirectCost(period=period, cost_item='推广费', business_type='旅拍', amount=travel_promo))
                         db.add(IndirectCost(period=period, cost_item='推广费', business_type='婚礼', amount=wedding_promo))
                 db.commit()
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
                 st.success("保存成功！"); st.rerun()
                 add_log(st.session_state.user_id, st.session_state.username, "录入间接成本", f"期间{period}")
             except Exception as e:
@@ -4555,11 +3688,6 @@ def indirect_cost_page():
                         db.add(IndirectCost(period=period, cost_item='推广费', business_type='旅拍', amount=travel_promo))
                         db.add(IndirectCost(period=period, cost_item='推广费', business_type='婚礼', amount=wedding_promo))
                 db.commit()
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
                 st.success("推广费已重新拆分"); st.rerun()
             except Exception as e:
                 db.rollback(); st.error(f"更新失败：{e}")
@@ -4622,11 +3750,6 @@ def monthly_stats_page():
                             db.add(MonthlyStats(period=p, business_type=bt, gross_leads=gross, order_count=orders))
                         db.commit()
                         msg = "毛客资/订单数导入成功！" if can_see else "毛客资/订单数导入成功（数量已隐藏）"
-                        try:
-                            from profit_engine import clear_profit_cache
-                            clear_profit_cache()
-                        except Exception:
-                            pass
                         st.success(msg)
                         st.rerun()
                     except Exception as e:
@@ -4713,10 +3836,8 @@ def monthly_stats_page():
         xj_orders = st.number_input("新疆订单数", min_value=0, value=0, step=1, key="xo", disabled=not can_see)
 
     db = SessionLocal()
-    try:
-        saved_stats = db.query(MonthlyStats).filter_by(period=period).all()
-    finally:
-        db.close()
+    saved_stats = db.query(MonthlyStats).filter_by(period=period).all()
+    db.close()
     if saved_stats:
         for s in saved_stats:
             if s.business_type == '旅拍':
@@ -4740,11 +3861,6 @@ def monthly_stats_page():
             db.add(MonthlyStats(period=period, business_type='婚礼', gross_leads=wedding_gross, order_count=wedding_orders))
             db.add(MonthlyStats(period=period, business_type='新疆', gross_leads=xj_gross, order_count=xj_orders))
             db.commit()
-            try:
-                from profit_engine import clear_profit_cache
-                clear_profit_cache()
-            except Exception:
-                pass
             st.success("月度数据已保存"); st.rerun()
             add_log(st.session_state.user_id, st.session_state.username, "录入月度基础数据", f"期间{period}")
         except Exception as e:
@@ -4777,14 +3893,12 @@ def order_query_page():
     module_name = "🔍 选片订单查询"
     can_see = has_permission(module_name, st.session_state.role)
     db = SessionLocal()
-    try:
-        total = db.query(func.count(Order.order_id)).scalar()
-        if can_see:
-            st.info(f"数据库共 **{total}** 条选片订单，请使用筛选条件查询（建议选择日期范围）")
-        else:
-            st.info("数据库共 *** 条选片订单，请使用筛选条件查询")
-    finally:
-        db.close()
+    total = db.query(func.count(Order.order_id)).scalar()
+    if can_see:
+        st.info(f"数据库共 **{total}** 条选片订单，请使用筛选条件查询（建议选择日期范围）")
+    else:
+        st.info("数据库共 *** 条选片订单，请使用筛选条件查询")
+    db.close()
 
     # ===== 新增：快速修正选片日期（放在最前面，方便直接使用） =====
     st.subheader("📅 快速修正选片日期")
@@ -4856,11 +3970,9 @@ def order_query_page():
             for ac in actual_costs:
                     if ac.order_id not in act_dict:
                         act_dict[ac.order_id] = {}
-                    # 同一订单同一费用项可能有多条记录（例：交付场地费 + 自租场地消耗并存，
-                    # 或旧版重复导入留下的多行）。报表引擎是 pivot_table(sum) 求和，
-                    # 这里必须同样求和 —— 旧写法取 max，会让本页的场地费比报表少一截。
+                    # 同一订单同一费用项取最大值，避免0覆盖非0
                     old_val = act_dict[ac.order_id].get(ac.cost_item, 0)
-                    act_dict[ac.order_id][ac.cost_item] = (old_val or 0) + (ac.amount or 0)
+                    act_dict[ac.order_id][ac.cost_item] = max(old_val or 0, ac.amount or 0)
                     actual_existing.add((ac.order_id, ac.cost_item))
             latest_batch = db.query(
                 CherryProductCost.batch_id,
@@ -5298,7 +4410,7 @@ def shooting_bill_import_page():
                 "覆盖已有记录",
                 "仅导入新记录（跳过已有）",
                 "合并金额（新旧相加）"
-            ], key="dup_shooting")
+            ])
         else:
             handle_dup = "仅导入新记录"
 
@@ -5339,11 +4451,6 @@ def shooting_bill_import_page():
                 msg = f"成功导入 {len(records)} 条记录" if can_see else "成功导入 *** 条记录"
                 st.success(msg)
                 add_log(st.session_state.user_id, st.session_state.username, "导入拍摄账单", f"导入{len(records)}条" if can_see else "导入***条")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
                 # ===== 覆盖率检查 =====
                 imported_oids = [r[0] for r in records]
                 render_shoot_coverage_check(imported_oids)
@@ -5417,10 +4524,7 @@ def delivery_cost_import_page():
             items = list({r[1] for r in records})
             existing = db.query(ActualDirectCost).filter(
                 ActualDirectCost.order_id.in_(oids),
-                ActualDirectCost.cost_item.in_(items),
-                # 排除「自租场地消耗」页写入的 场地 记录：那是另一笔独立成本，
-                # 若当作重复记录被本页「覆盖」删掉，自租消耗的钱就凭空消失了。
-                or_(ActualDirectCost.remark.is_(None), ActualDirectCost.remark != '自租场地')
+                ActualDirectCost.cost_item.in_(items)
             ).all()
             existing_map = {(e.order_id, e.cost_item): e.amount for e in existing}
             duplicates_info = [(r[0], r[1], existing_map.get((r[0], r[1]), 0), r[2]) for r in records if (r[0], r[1]) in existing_map]
@@ -5433,7 +4537,7 @@ def delivery_cost_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '费用项', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复记录，请选择处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_delivery")
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
         else:
             handle_dup = "仅导入新记录"
 
@@ -5441,28 +4545,18 @@ def delivery_cost_import_page():
             db = SessionLocal()
             try:
                 dup_keys = {(d[0], d[1]) for d in duplicates_info}
-                _not_self_rent = or_(ActualDirectCost.remark.is_(None),
-                                     ActualDirectCost.remark != '自租场地')
 
                 if handle_dup == "覆盖已有记录":
                     for (oid, item) in dup_keys:
-                        db.query(ActualDirectCost).filter(
-                            ActualDirectCost.order_id == oid,
-                            ActualDirectCost.cost_item == item,
-                            _not_self_rent
-                        ).delete(synchronize_session=False)
+                        db.query(ActualDirectCost).filter_by(order_id=oid, cost_item=item).delete()
                     db.commit()
                     for oid, item, amt, remark in records:
                         db.add(ActualDirectCost(order_id=oid, cost_item=item, amount=amt, remark=remark))
 
                 elif handle_dup == "合并金额（新旧相加）":
                     for (oid, item, old_amt, new_amt) in duplicates_info:
-                        db.query(ActualDirectCost).filter(
-                            ActualDirectCost.order_id == oid,
-                            ActualDirectCost.cost_item == item,
-                            _not_self_rent
-                        ).delete(synchronize_session=False)
-                        merged = (old_amt or 0) + new_amt
+                        db.query(ActualDirectCost).filter_by(order_id=oid, cost_item=item).delete()
+                        merged = old_amt + new_amt
                         remark = next((r[3] for r in records if r[0] == oid and r[1] == item), "")
                         db.add(ActualDirectCost(order_id=oid, cost_item=item, amount=merged, remark=remark))
                     for oid, item, amt, remark in records:
@@ -5479,11 +4573,6 @@ def delivery_cost_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条费用" if can_see else "成功导入 *** 条费用")
                 add_log(st.session_state.user_id, st.session_state.username, "导入交付费用", f"共{len(records)}条" if can_see else "共***条")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -5497,9 +4586,8 @@ def venue_self_rent_import_page():
     st.markdown("""
     **说明**：  
     - 上传 Excel 文件，需包含列：`订单号`、`成本`。  
-    - 导入「场地」实际直接成本，与交付费用中的场地费**相加**（互不覆盖）。
-    - 重复处理：覆盖 / 仅导入新记录 / 合并金额（只作用于本页导入的自租记录）。
-    - 上传后页面会先做**导入前自检**：告诉你这批钱会落到哪个月、有没有订单号对不上。
+    - 导入「场地」实际直接成本，与交付费用中的场地费合并。  
+    - 重复处理：覆盖 / 仅导入新记录 / 合并金额。
     """)
     uploaded = st.file_uploader("上传自租场地消耗Excel", type=["xlsx", "xls"])
     if uploaded:
@@ -5519,11 +4607,7 @@ def venue_self_rent_import_page():
         df = df.rename(columns={oid_col: '订单号', cost_col: '成本'})
         df['成本'] = pd.to_numeric(df['成本'], errors='coerce').fillna(0)
         df = df.dropna(subset=['订单号', '成本'])
-        # 订单号归一：Excel 常把纯数字订单号存成 2609010001.0 / 2.60901e+09，
-        # 直接 astype(str) 会得到 "2609010001.0"，与库里的 "2609010001" 对不上，
-        # 引擎按 order_id 精确关联时这批钱就永远不会进报表（历史上很难察觉）。
-        df['订单号'] = (df['订单号'].astype(str).str.strip()
-                        .str.replace(r'\.0$', '', regex=True))
+        df['订单号'] = df['订单号'].astype(str).str.strip()
         df = df[~df['订单号'].isin(['', 'nan', 'None', 'NaN'])]
         records = [(row['订单号'], float(row['成本'])) for _, row in df.iterrows()]
         if not records:
@@ -5531,61 +4615,12 @@ def venue_self_rent_import_page():
             return
         st.info(f"共解析 {len(records)} 条记录" if can_see else "共解析 *** 条记录")
 
-        # ---------- 导入前自检：这批数据到底会不会进报表 ----------
-        # 两个静默失败点：①订单号在订单表里查不到（金额进了库但引擎关联不上）
-        # ②订单号查得到，但选片日期不在你要看的那个月（报表按月归到别的月份去了）
-        _ids = [r[0] for r in records]
-        _chk = SessionLocal()
-        try:
-            _rows = _chk.query(Order.order_id, Order.selection_date).filter(
-                Order.order_id.in_(_ids)
-            ).all()
-        finally:
-            _chk.close()
-        _sel = {o[0]: o[1] for o in _rows}
-        _miss = [i for i in _ids if i not in _sel]
-        _by_month = {}
-        for _oid, _amt in records:
-            if _oid in _sel:
-                _sd = _sel[_oid]
-                _k = f"{_sd.year}年{_sd.month}月" if _sd else "无选片日期"
-                _a, _c = _by_month.get(_k, (0.0, 0))
-                _by_month[_k] = (_a + _amt, _c + 1)
-        if can_see:
-            st.markdown("**🔍 导入前自检**")
-            st.caption(f"本次解析 **{len(records)}** 条，金额合计 **¥{sum(r[1] for r in records):,.2f}**")
-            if _by_month:
-                _lines = "；".join(f"{k} **{c}** 条 ¥{a:,.0f}"
-                                   for k, (a, c) in sorted(_by_month.items(), reverse=True))
-                st.caption(f"按这些订单的**选片日期**分布：{_lines}")
-                st.caption("报表是按选片日期归月的 —— 只有选片日期落在该月的订单，金额才会出现在那个月的报表里。")
-            if _miss:
-                st.warning(
-                    f"⚠️ 有 **{len(_miss)}** 条订单号在系统订单表里**查不到**，这些费用不会出现在任何报表里：\n\n"
-                    f"{'、'.join(_miss[:5])}{' …' if len(_miss) > 5 else ''}\n\n"
-                    "常见原因：订单号前后有空格、被存成了数字（带 .0 或科学计数）、或该订单还没导入系统。\n\n"
-                    f"**已自动跳过这 {len(_miss)} 条**，只导入能匹配到订单的 {len(records) - len(_miss)} 条；"
-                    "补齐订单后再上传一次即可。"
-                )
-        else:
-            st.caption(f"自检：订单表可匹配 {len(_sel)} 条，未匹配 {len(_miss)} 条（金额已隐藏）")
-
-        _skipped = len(_miss)
-        if _skipped:
-            records = [r for r in records if r[0] in _sel]
-            if not records:
-                st.error("全部记录的订单号都查不到，已停止导入。请先核对订单号或先导入订单。")
-                return
-
         db = SessionLocal()
         try:
             oids = [r[0] for r in records]
             existing = db.query(ActualDirectCost).filter(
                 ActualDirectCost.order_id.in_(oids),
-                ActualDirectCost.cost_item == '场地',
-                # 只把「自租场地」自己的记录算作重复：
-                # 交付费用导入的场地费（remark 为「日期:…」或空串）是另一笔成本，不能当成重复记录覆盖掉。
-                or_(ActualDirectCost.remark == '自租场地', ActualDirectCost.remark.is_(None))
+                ActualDirectCost.cost_item == '场地'
             ).all()
             existing_map = {e.order_id: e.amount for e in existing}
             duplicates_info = [(oid, existing_map.get(oid, 0), amt) for oid, amt in records if oid in existing_map]
@@ -5598,7 +4633,7 @@ def venue_self_rent_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_venue")
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
         else:
             handle_dup = "仅导入新记录"
 
@@ -5606,28 +4641,18 @@ def venue_self_rent_import_page():
             db = SessionLocal()
             try:
                 dup_oids = {d[0] for d in duplicates_info}
-                _venue_self = or_(ActualDirectCost.remark == '自租场地', ActualDirectCost.remark.is_(None))
 
                 if handle_dup == "覆盖已有记录":
                     for oid in dup_oids:
-                        db.query(ActualDirectCost).filter(
-                            ActualDirectCost.order_id == oid,
-                            ActualDirectCost.cost_item == '场地',
-                            _venue_self
-                        ).delete(synchronize_session=False)
+                        db.query(ActualDirectCost).filter_by(order_id=oid, cost_item='场地').delete()
                     db.commit()
                     for oid, amt in records:
                         db.add(ActualDirectCost(order_id=oid, cost_item='场地', amount=amt, remark='自租场地'))
 
                 elif handle_dup == "合并金额（新旧相加）":
                     for oid, old_amt, new_amt in duplicates_info:
-                        db.query(ActualDirectCost).filter(
-                            ActualDirectCost.order_id == oid,
-                            ActualDirectCost.cost_item == '场地',
-                            _venue_self
-                        ).delete(synchronize_session=False)
-                        db.add(ActualDirectCost(order_id=oid, cost_item='场地',
-                                                amount=(old_amt or 0) + new_amt, remark='自租场地'))
+                        db.query(ActualDirectCost).filter_by(order_id=oid, cost_item='场地').delete()
+                        db.add(ActualDirectCost(order_id=oid, cost_item='场地', amount=old_amt + new_amt, remark='自租场地'))
                     for oid, amt in records:
                         if oid in dup_oids:
                             continue
@@ -5640,18 +4665,8 @@ def venue_self_rent_import_page():
                         db.add(ActualDirectCost(order_id=oid, cost_item='场地', amount=amt, remark='自租场地'))
 
                 db.commit()
-                _skip_txt = f"（另有 {_skipped} 条订单号查不到，已跳过）" if _skipped else ""
-                st.success((f"成功导入 {len(records)} 条场地费用{_skip_txt}") if can_see
-                           else "成功导入 *** 条场地费用")
-                if can_see:
-                    st.caption(f"本次写入金额合计 ¥{sum(r[1] for r in records):,.2f}。"
-                               "报表缓存已清空，请回到「📊 生成利润表」重新生成对应月份再看。")
+                st.success(f"成功导入 {len(records)} 条场地费用" if can_see else "成功导入 *** 条场地费用")
                 add_log(st.session_state.user_id, st.session_state.username, "导入自租场地消耗", f"共{len(records)}条" if can_see else "共***条")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -5721,7 +4736,7 @@ def micro_film_shooting_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_mf_shoot")
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
         else:
             handle_dup = "仅导入新记录"
 
@@ -5755,11 +4770,6 @@ def micro_film_shooting_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条微电影拍摄费用" if can_see else "成功导入 *** 条")
                 add_log(st.session_state.user_id, st.session_state.username, "导入微电影拍摄账单", f"共{len(records)}条" if can_see else "共***条")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -5817,7 +4827,7 @@ def micro_film_editing_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_mf_edit")
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
         else:
             handle_dup = "仅导入新记录"
 
@@ -5851,11 +4861,6 @@ def micro_film_editing_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条微电影剪辑费用" if can_see else "成功导入 *** 条")
                 add_log(st.session_state.user_id, st.session_state.username, "导入微电影剪辑账单", f"共{len(records)}条" if can_see else "共***条")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -5907,7 +4912,7 @@ def second_sales_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_second")
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
         else:
             handle_dup = "仅导入新记录"
 
@@ -5941,11 +4946,6 @@ def second_sales_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条二销选片费" if can_see else "成功导入 *** 条")
                 add_log(st.session_state.user_id, st.session_state.username, "导入二销选片账单", f"共{len(records)}条" if can_see else "共***条")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -5992,22 +4992,18 @@ def retouch_bill_import_page():
         try:
             oids = [r[0] for r in records]
             existing_orders = db.query(Order).filter(Order.order_id.in_(oids)).all()
-            # 只把「已有修片费 > 0」的订单算作重复：
-            # 金额为 0 的订单其实从未导入过修片费，属于「首次导入」，不需要逐单确认，
-            # 否则每次导入都会列出上千行（且选「仅导入新记录」还会把它们错误跳过）。
-            existing_map = {o.order_id: float(o.actual_retouch_fee)
-                            for o in existing_orders if (o.actual_retouch_fee or 0) > 0}
-            duplicates_info = [(oid, existing_map[oid], amt) for oid, amt in records if oid in existing_map]
+            existing_map = {o.order_id: (o.actual_retouch_fee or 0) for o in existing_orders}
+            duplicates_info = [(oid, existing_map.get(oid, 0), amt) for oid, amt in records if oid in existing_map]
         finally:
             db.close()
 
         if duplicates_info:
             if can_see:
-                st.warning(f"检测到 {len(duplicates_info)} 个订单已有修片费（金额大于 0），请选择处理方式：")
+                st.warning(f"检测到 {len(duplicates_info)} 个订单已有修片费，请选择：")
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_retouch")
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
         else:
             handle_dup = "仅导入新记录"
 
@@ -6029,11 +5025,6 @@ def retouch_bill_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条修片费" if can_see else "成功导入 *** 条")
                 add_log(st.session_state.user_id, st.session_state.username, "导入修片账单", f"共{len(records)}条" if can_see else "共***条")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -6096,7 +5087,7 @@ def factory_bill_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_factory")
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
         else:
             handle_dup = "仅导入新记录"
 
@@ -6130,11 +5121,6 @@ def factory_bill_import_page():
                 db.commit()
                 st.success(f"成功导入 {len(records)} 条工厂费用" if can_see else "成功导入 *** 条")
                 add_log(st.session_state.user_id, st.session_state.username, "导入工厂账单", f"共{len(records)}条" if can_see else "共***条")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -6155,28 +5141,6 @@ def xinjiang_expense_import_page():
     - 这些费用将存入间接费用表，在利润表中按新疆选片订单数分摊。  
     - 重复导入同一期间同费用项会自动覆盖。
     """)
-    with st.expander("📋 已导入的新疆费用（自查用）", expanded=False):
-        _db_chk = SessionLocal()
-        try:
-            _recs = _db_chk.query(IndirectCost).filter(
-                IndirectCost.business_type == '新疆',
-                IndirectCost.cost_item.in_(['新疆拍样费用', '新疆报销费用'])
-            ).order_by(IndirectCost.period.desc()).all()
-            if _recs:
-                _df_chk = pd.DataFrame([{'期间': r.period, '费用项': r.cost_item, '金额': r.amount} for r in _recs])
-                _df_chk['期间'] = _df_chk['期间'].astype(str)
-                if can_see:
-                    st.dataframe(_df_chk, width='stretch', hide_index=True)
-                    st.caption(f"共 {len(_df_chk)} 条，合计 ¥{float(_df_chk['金额'].sum()):,.2f}。"
-                               f"利润表里「新疆」业务线的「样片研发」= 此处「新疆拍样费用」按新疆订单数分摊后的结果；"
-                               f"本月没有记录，利润表新疆那一栏的样片研发就会是 0。")
-                else:
-                    st.dataframe(mask_dataframe(_df_chk), width='stretch')
-            else:
-                st.warning("目前一条新疆费用都没有导入过。若本月确实发生了新疆拍样费，"
-                           "请在上方上传 Excel 补录，否则利润表「新疆」的「样片研发」会是 0。")
-        finally:
-            _db_chk.close()
     uploaded = st.file_uploader("上传新疆费用Excel", type=["xlsx", "xls"])
     if uploaded:
         df = pd.read_excel(uploaded)
@@ -6210,11 +5174,6 @@ def xinjiang_expense_import_page():
                 msg = f"成功导入 {len(df)} 条新疆费用" if can_see else "成功导入 *** 条新疆费用"
                 st.success(msg)
                 add_log(st.session_state.user_id, st.session_state.username, "导入新疆费用", f"共{len(df)}条" if can_see else "共***条")
-                try:
-                    from profit_engine import clear_profit_cache
-                    clear_profit_cache()
-                except Exception:
-                    pass
             except Exception as e:
                 db.rollback()
                 st.error(f"导入失败：{e}")
@@ -7010,7 +5969,7 @@ def xinjiang_shooting_import_page():
                 "覆盖已有记录",
                 "仅导入新记录（跳过已有）",
                 "合并金额（新旧相加）"
-            ], key="dup_xj_shoot")
+            ])
         else:
             handle_dup = "仅导入新记录"
 
@@ -7197,7 +6156,7 @@ def fix_historical_shooting_cost_page():
     这样在账单查询和利润分析时就能正确显示“摄化费用”明细。
     > ⚠️ 操作不可撤销，建议先备份数据库。
     """)
-    if st.button("开始修复历史数据", type="primary", disabled=(st.session_state.role != 'admin')):
+    if st.button("开始修复历史数据", type="primary"):
         db = SessionLocal()
         try:
             records = db.query(ActualDirectCost).filter(
@@ -7220,7 +6179,6 @@ def fix_historical_shooting_cost_page():
             st.error(f"修复失败：{e}")
         finally:
             db.close()
-    st.caption("⚠️ 仅管理员可执行")
 
 def clean_duplicates_page():
     st.header("🧹 一键清理重复数据")
@@ -7236,7 +6194,7 @@ def clean_duplicates_page():
 
     > ⚠️ 去重操作不可逆，请确认后执行。
     """)
-    if st.button("开始清理全部重复数据", type="primary", disabled=(st.session_state.role != 'admin')):
+    if st.button("开始清理全部重复数据", type="primary"):
         db = SessionLocal()
         try:
             # 1. 交付费用去重（含日期）
@@ -7314,17 +6272,11 @@ def clean_duplicates_page():
             msg = f"清理完成！交付费用：{del1_delivery} 条，其他实际成本：{del2_other} 条，月度基础数据：{del3} 条，间接费用：{del4} 条" if can_see else "清理完成！（数量已隐藏）"
             st.success(msg)
             add_log(st.session_state.user_id, st.session_state.username, "清理重复数据", f"成本{total_del}，基础{del3}，间接{del4}" if can_see else "清理完成")
-            try:
-                from profit_engine import clear_profit_cache
-                clear_profit_cache()
-            except Exception:
-                pass
         except Exception as e:
             db.rollback()
             st.error(f"清理失败：{e}")
         finally:
             db.close()
-    st.caption("⚠️ 仅管理员可执行")
 
 def rule_explanation_page():
     st.header("📖 利润计算规则说明")
@@ -7378,7 +6330,7 @@ def rule_explanation_page():
     - **人工成本（工资）**：按业务类型（旅拍/婚礼）各自汇总所有部门工资，除以各自的选片订单数得到均价，再乘以每个套系的订单数进行分摊。新疆业务：新疆旅拍套系使用旅拍业务的部门工资均价，新疆婚礼套系使用婚礼业务的部门工资均价。
     - **推广费**：先根据“推广费分摊设置”中的婚礼占比，将总推广费拆分为旅拍推广费和婚礼推广费。旅拍推广费按旅拍选片订单数分摊；婚礼推广费按婚礼选片订单数分摊。新疆业务：新疆旅拍套系使用旅拍推广费均价，新疆婚礼套系使用婚礼推广费均价。
     - **其他间接费用（房租水电、税费及手续费、样片研发、场地铺设费、舆情处理）**：旅拍和婚礼分别汇总各自这些项目的金额。先按业务类型内部分摊（各自按选片订单数），再与新疆套系共同参与全局分摊。新疆业务：新疆旅拍使用旅拍该类费用的均价，新疆婚礼使用婚礼均价。**场地铺设费**：特指无法分入具体订单的场地公共费用，处理方式同上。
-    - **新疆拍样费用**：单独汇总**所选期间**的新疆拍样费用（business_type='新疆'、费用项='新疆拍样费用'，须从「🏜️ 新疆拍样/报销费用」页或「📈 录入间接成本」批量导入时业务类型填「新疆」），按新疆选片订单总数（含所有新疆套系）进行均摊，并**合并入“样片研发”列**展示。**未导入时该金额为 0，利润表「新疆」业务线的「样片研发」就显示 0**。新疆报销费用若导入，将作为单独列显示在利润表中，并按同样规则分摊。
+    - **新疆拍样费用**：单独汇总所有期间的新疆拍样费用（business_type='新疆'），按新疆选片订单总数（含所有新疆套系）进行均摊，并**合并入“样片研发”列**展示。新疆报销费用若导入，将作为单独列显示在利润表中，并按同样规则分摊。
     - **分摊特殊情况**：如果某业务类型（如旅拍）在所选期间内订单数为0，则其对应费用不分摊，避免除零错误。
 
     ## 四、推广费分摊设置
@@ -7408,63 +6360,56 @@ def rule_explanation_page():
     """)
 
 def user_management_page():
-    if st.session_state.role != 'admin':
-        st.error("无权限：该页面仅管理员可访问。")
-        st.stop()
     st.header("👥 用户管理")
     module_name = "👥 用户管理"
     can_see = has_permission(module_name, st.session_state.role)
     db = SessionLocal()
-    try:
-        with st.expander("➕ 添加用户"):
-            new_user = st.text_input("用户名")
-            new_pwd = st.text_input("密码", type="password")
-            role = st.selectbox("角色", ["editor", "admin"])
-            if st.button("创建"):
-                if new_user and new_pwd:
-                    db.add(User(username=new_user, password_hash=generate_password_hash(new_pwd), role=role))
-                    db.commit()
-                    st.success("创建成功")
-                    add_log(st.session_state.user_id, st.session_state.username, "创建用户", new_user)
-                else: st.warning("请填写完整")
-        users = db.query(User).all()
-        if users:
-            df_users = pd.DataFrame([{'ID':u.id,'用户名':u.username,'角色':u.role,'创建时间':u.created_at} for u in users])
-            if can_see:
-                st.dataframe(df_users, width='stretch')
-            else:
-                st.dataframe(mask_dataframe(df_users), width='stretch')
-            user_to_del = st.selectbox("删除用户", [""] + [u.username for u in users if u.username != 'admin'])
-            if user_to_del and st.button("确认删除"):
-                db.query(User).filter_by(username=user_to_del).delete()
+    with st.expander("➕ 添加用户"):
+        new_user = st.text_input("用户名")
+        new_pwd = st.text_input("密码", type="password")
+        role = st.selectbox("角色", ["editor", "admin"])
+        if st.button("创建"):
+            if new_user and new_pwd:
+                db.add(User(username=new_user, password_hash=generate_password_hash(new_pwd), role=role))
                 db.commit()
-                st.success("已删除")
-                add_log(st.session_state.user_id, st.session_state.username, "删除用户", user_to_del)
-    finally:
-        db.close()
+                st.success("创建成功")
+                add_log(st.session_state.user_id, st.session_state.username, "创建用户", new_user)
+            else: st.warning("请填写完整")
+    users = db.query(User).all()
+    if users:
+        df_users = pd.DataFrame([{'ID':u.id,'用户名':u.username,'角色':u.role,'创建时间':u.created_at} for u in users])
+        if can_see:
+            st.dataframe(df_users, width='stretch')
+        else:
+            st.dataframe(mask_dataframe(df_users), width='stretch')
+        user_to_del = st.selectbox("删除用户", [""] + [u.username for u in users if u.username != 'admin'])
+        if user_to_del and st.button("确认删除"):
+            db.query(User).filter_by(username=user_to_del).delete()
+            db.commit()
+            st.success("已删除")
+            add_log(st.session_state.user_id, st.session_state.username, "删除用户", user_to_del)
+    db.close()
 
 def log_view_page():
     st.header("📜 操作日志")
     module_name = "📜 操作日志"
     can_see = has_permission(module_name, st.session_state.role)
     db = SessionLocal()
-    try:
-        col1, col2 = st.columns(2)
-        with col1: filter_user = st.text_input("筛选用户")
-        with col2: filter_action = st.selectbox("筛选操作", [""] + ["登录","导入收入数据","导入实际成本","生成利润表","维护标准成本","用户管理"])
-        logs = db.query(OperationLog)
-        if filter_user: logs = logs.filter(OperationLog.username.contains(filter_user))
-        if filter_action: logs = logs.filter(OperationLog.action == filter_action)
-        logs = logs.order_by(OperationLog.timestamp.desc()).limit(200).all()
-        if logs:
-            df_logs = pd.DataFrame([{'时间':l.timestamp,'用户':l.username,'操作':l.action,'详情':l.details} for l in logs])
-            if can_see:
-                st.dataframe(df_logs, width='stretch')
-            else:
-                st.dataframe(mask_dataframe(df_logs), width='stretch')
-        else: st.info("无记录")
-    finally:
-        db.close()
+    col1, col2 = st.columns(2)
+    with col1: filter_user = st.text_input("筛选用户")
+    with col2: filter_action = st.selectbox("筛选操作", [""] + ["登录","导入收入数据","导入实际成本","生成利润表","维护标准成本","用户管理"])
+    logs = db.query(OperationLog)
+    if filter_user: logs = logs.filter(OperationLog.username.contains(filter_user))
+    if filter_action: logs = logs.filter(OperationLog.action == filter_action)
+    logs = logs.order_by(OperationLog.timestamp.desc()).limit(200).all()
+    if logs:
+        df_logs = pd.DataFrame([{'时间':l.timestamp,'用户':l.username,'操作':l.action,'详情':l.details} for l in logs])
+        if can_see:
+            st.dataframe(df_logs, width='stretch')
+        else:
+            st.dataframe(mask_dataframe(df_logs), width='stretch')
+    else: st.info("无记录")
+    db.close()
 
 # 会话超时登出已统一在脚本顶部由 _auth.check_session_timeout() 处理（闲置超时语义）。
 # ⚠️ 这里原先有一段重复检查：
