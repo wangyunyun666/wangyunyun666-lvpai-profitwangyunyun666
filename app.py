@@ -9,7 +9,7 @@ from datetime import datetime, date, timedelta
 from workbench import workbench_page, _wb_handle_goto
 from import_center import import_center_page, inject_ic_css as _ic_css
 import auth_persist as _auth
-from database import SessionLocal, User, Order, SetStandardCost, ActualDirectCost, CherryProductCost, IndirectCost, AllocationRule, OperationLog, MonthlyStats, ModulePermission, ProfitSnapshot, EmployeeSalary
+from database import SessionLocal, User, Order, SetStandardCost, ActualDirectCost, CherryProductCost, IndirectCost, AllocationRule, OperationLog, MonthlyStats, ModulePermission, ProfitSnapshot, EmployeeSalary, SET_TYPE_MAP
 from profit_engine import generate_profit_report, generate_profit_report_multi_month, is_excluded_order
 from sqlalchemy import func
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -37,23 +37,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-SET_TYPE_MAP = {
-    "丽江员工特惠5577": "旅拍", "丽江网红款5980": "旅拍", "大理网红款5980": "旅拍",
-    "大理员工特惠5577": "旅拍", "大理爆款6980": "旅拍", "丽江爆款6980": "旅拍",
-    "大理全包套餐8980": "旅拍", "丽江8999一价全包套餐": "旅拍", "大理9777 国庆活动": "旅拍",
-    "丽江全包套系9980": "旅拍", "大理双影像618活动套餐": "旅拍", "双11爆款4911大理": "旅拍",
-    "大理8888一价全包套系": "旅拍", "大理双影像9888限定套餐": "旅拍", "店庆爆款丽江6888": "旅拍",
-    "丽江8888一价全包套餐": "旅拍", "大理定制套系10980": "旅拍", "双11爆款丽江": "旅拍",
-    "丽江定制套系10980": "旅拍", "店庆爆款大理6888": "旅拍", "丽江主理人套系10980": "旅拍",
-    "大理主理人套系10980": "旅拍", "丽江小发哥专属10980": "旅拍", "大理小发哥专属10980": "旅拍",
-    "丽江小发哥专属12520": "旅拍", "丽江小发哥专属16980": "旅拍", "大理小发哥专属16980": "旅拍",
-    "新疆特惠8980": "旅拍", "新疆网红款10980": "旅拍", "新疆高定款12980": "旅拍",
-    "13980丽江婚礼": "婚礼", "16980丽江目的地婚礼": "婚礼", "16980丽江婚礼": "婚礼",
-    "13980丽江婚礼套系": "婚礼", "14980丽江婚礼套系": "婚礼", "14980丽江婚礼": "婚礼", "19980丽江婚礼": "婚礼", "16980大理婚礼": "婚礼",
-    "19980大理婚礼": "婚礼", "19980丽江目的地婚礼": "婚礼", "16980丽江目的地": "婚礼",
-    "29980丽江目的地婚礼": "婚礼", "20980新疆婚礼": "婚礼", "14980大理婚礼": "婚礼",
-    "16980新疆婚礼": "婚礼", "9999纯拍婚礼丽江": "婚礼",
-}
 
 if 'logged_in' not in st.session_state: st.session_state.logged_in = False
 if 'user_id' not in st.session_state: st.session_state.user_id = None

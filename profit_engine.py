@@ -1,7 +1,7 @@
 ﻿# profit_engine.py
 import pandas as pd
 from datetime import datetime, timedelta
-from database import SessionLocal, Order, SetStandardCost, ActualDirectCost, CherryProductCost, IndirectCost, AllocationRule, MonthlyStats
+from database import SessionLocal, Order, SetStandardCost, ActualDirectCost, CherryProductCost, IndirectCost, AllocationRule, MonthlyStats, SET_TYPE_MAP
 from sqlalchemy import func
 from streamlit import cache_data
 
@@ -41,15 +41,21 @@ def _valid_biz_type(t):
 
 
 def infer_type_from_set(set_name):
-    """按套系名关键字推断业务类型；推断不出返回 None。
+    """按套系名推断业务类型；推断不出返回 None。
+
+    优先查 SET_TYPE_MAP（database.py 单源，与导入收入共用，含改名后新套系名），
+    再按关键字兜底。
 
     Args:
         set_name: 订单的套系名称，可能为 None。
 
     Returns:
-        str | None: 命中「婚礼」返回 '婚礼'，命中「旅拍」返回 '旅拍'，否则 None。
+        str | None: 命中返回 '婚礼'/'旅拍'，否则 None。
     """
-    s = str(set_name or '')
+    s = str(set_name or '').strip()
+    t = SET_TYPE_MAP.get(s)
+    if t:
+        return t
     if '婚礼' in s:
         return '婚礼'
     if '旅拍' in s:
