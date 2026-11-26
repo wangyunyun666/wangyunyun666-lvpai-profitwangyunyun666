@@ -3096,7 +3096,7 @@ def import_income_page():
                 st.dataframe(dup_df)
             else:
                 st.warning(f"检测到 {len(duplicates_info)} 个订单已存在，请选择处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", [
+            handle_dup = st.radio("重复处理", key="dup_income", options=[
                 "覆盖已有记录",
                 "仅导入新记录（跳过已有）"
             ])
@@ -4389,7 +4389,7 @@ def shooting_bill_import_page():
                 st.dataframe(dup_df)
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", [
+            handle_dup = st.radio("重复处理", key="dup_photo", options=[
                 "覆盖已有记录",
                 "仅导入新记录（跳过已有）",
                 "合并金额（新旧相加）"
@@ -4520,7 +4520,7 @@ def delivery_cost_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '费用项', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复记录，请选择处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_wedding_delivery")
         else:
             handle_dup = "仅导入新记录"
 
@@ -4616,7 +4616,7 @@ def venue_self_rent_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_field_self")
         else:
             handle_dup = "仅导入新记录"
 
@@ -4719,7 +4719,7 @@ def micro_film_shooting_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_mv_photo")
         else:
             handle_dup = "仅导入新记录"
 
@@ -4810,7 +4810,7 @@ def micro_film_editing_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_mv_edit")
         else:
             handle_dup = "仅导入新记录"
 
@@ -4895,7 +4895,7 @@ def second_sales_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_second_sel")
         else:
             handle_dup = "仅导入新记录"
 
@@ -4986,7 +4986,7 @@ def retouch_bill_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_retouch")
         else:
             handle_dup = "仅导入新记录"
 
@@ -5070,7 +5070,7 @@ def factory_bill_import_page():
                 st.dataframe(pd.DataFrame(duplicates_info, columns=['订单号', '已有金额', '本次金额']))
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"])
+            handle_dup = st.radio("重复处理", ["覆盖已有记录", "仅导入新记录（跳过已有）", "合并金额（新旧相加）"], key="dup_factory")
         else:
             handle_dup = "仅导入新记录"
 
@@ -5948,7 +5948,7 @@ def xinjiang_shooting_import_page():
                 st.dataframe(dup_df)
             else:
                 st.warning("检测到重复订单，请选择重复处理方式（数据已隐藏）")
-            handle_dup = st.radio("重复处理", [
+            handle_dup = st.radio("重复处理", key="dup_xj_photo", options=[
                 "覆盖已有记录",
                 "仅导入新记录（跳过已有）",
                 "合并金额（新旧相加）"
